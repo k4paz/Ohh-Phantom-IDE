@@ -93,19 +93,83 @@ export function closeMenu() { if (ctxEl) { ctxEl.remove(); ctxEl = null; } }
 export function menu(x, y, items) {
   closeMenu();
   const el = h('div.ctx');
-  for (const it of items) {
-    if (!it) continue;
-    if (it === '-') { el.appendChild(h('div.sep')); continue; }
-    if (it.header) { el.appendChild(h('div.lbl', it.header)); continue; }
-    el.appendChild(h('div.it' + (it.danger ? '.danger' : '') + (it.disabled ? '.dis' : ''), {
+  const list = h('div.ctx-list');
+  const searchable = items.filter((it) => it && it !== '-' && !it.header).length >= 8;
+  const search = searchable ? h('input.ctx-search', {
+    type: 'search', placeholder: 'Search actions...', spellcheck: false, 'aria-label': 'Search menu'
+  }) : null;
+  let activeIndex = -1;
+  let wheelDelta = 0;
+  const selectableRows = () => [...list.querySelectorAll('.it:not(.dis)')];
+  const select = (index, scroll = true) => {
+    const rows = selectableRows();
+    if (!rows.length) { activeIndex = -1; return; }
+    activeIndex = (index + rows.length) % rows.length;
+    rows.forEach((row, i) => row.classList.toggle('on', i === activeIndex));
+    if (scroll) rows[activeIndex].scrollIntoView({ block: 'nearest' });
+  };
+  const appendItem = (it) => {
+    if (!it) return;
+    if (it === '-') { list.appendChild(h('div.sep')); return; }
+    if (it.header) { list.appendChild(h('div.lbl', it.header)); return; }
+    list.appendChild(h('div.it' + (it.danger ? '.danger' : '') + (it.disabled ? '.dis' : ''), {
       on: { mousedown: (e) => e.stopPropagation(), click: () => { closeMenu(); it.action && it.action(); } }
-    }, h('span.ck', it.check ? '✓' : ''), it.label, it.key ? h('span.k', it.key) : null));
-  }
+    }, h('span.ck', it.check ? '✓' : ''), h('span.ctx-label', it.label), it.key ? h('span.k', it.key) : null));
+  };
+  const render = () => {
+    list.innerHTML = '';
+    activeIndex = -1;
+    wheelDelta = 0;
+    el.classList.remove('wheel-nav');
+    const query = search && search.value.trim().toLowerCase();
+    const visible = query
+      ? items.filter((it) => it && it !== '-' && !it.header && `${it.label || ''} ${it.key || ''}`.toLowerCase().includes(query))
+      : items;
+    if (query && !visible.length) list.appendChild(h('div.ctx-empty', 'no matches'));
+    else visible.forEach(appendItem);
+  };
+  if (search) {
+    search.addEventListener('input', render);
+    el.append(search, list);
+  } else el.appendChild(list);
+  el.tabIndex = -1;
+  el.addEventListener('wheel', (e) => {
+    if (!selectableRows().length || !e.deltaY) return;
+    e.preventDefault();
+    wheelDelta += e.deltaY;
+    if (Math.abs(wheelDelta) < 30) return;
+    const direction = Math.sign(wheelDelta);
+    wheelDelta = 0;
+    el.classList.add('wheel-nav');
+    select(activeIndex < 0 ? (direction > 0 ? 0 : selectableRows().length - 1) : activeIndex + direction);
+  }, { passive: false });
+  el.addEventListener('mousemove', (e) => {
+    const row = e.target.closest('.it:not(.dis)');
+    if (!row || !list.contains(row)) return;
+    const index = selectableRows().indexOf(row);
+    if (index >= 0 && index !== activeIndex) {
+      el.classList.remove('wheel-nav');
+      select(index, false);
+    }
+  });
+  el.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const direction = e.key === 'ArrowDown' ? 1 : -1;
+      select(activeIndex < 0 ? (direction > 0 ? 0 : selectableRows().length - 1) : activeIndex + direction);
+    } else if (e.key === 'Enter' && activeIndex >= 0) {
+      e.preventDefault();
+      selectableRows()[activeIndex]?.click();
+    }
+  });
+  render();
   root().appendChild(el);
   ctxEl = el;
   const r = el.getBoundingClientRect();
   el.style.left = Math.min(x, innerWidth - r.width - 4) + 'px';
   el.style.top = Math.min(y, innerHeight - r.height - 4) + 'px';
+  if (search) search.focus();
+  else el.focus({ preventScroll: true });
 }
 document.addEventListener('mousedown', (e) => { if (ctxEl && !ctxEl.contains(e.target)) closeMenu(); }, true);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });

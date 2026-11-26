@@ -5,13 +5,18 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const vm = require('vm');
 const { execFileSync } = require('child_process');
 const { createCore } = require('../main/registry');
+const {
+  subscriptionEnvironment, agentOptions, assistedReadApproval, projectScopedApproval, normalizeCopilotQuota
+} = require('../main/services/agents');
 
 const events = [];
 const listeners = new Map();
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phantom-data-'));
 const core = createCore({
-  dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'phantom-data-')),
+  dataDir,
   emit: (ch, p) => { events.push([ch, p]); (listeners.get(ch) || []).forEach((f) => f(p)); }
 });
 const on = (ch, f) => { if (!listeners.has(ch)) listeners.set(ch, []); listeners.get(ch).push(f); };
@@ -36,10 +41,182 @@ const assert = (c, m) => { if (!c) throw new Error('assert: ' + m); };
   fs.writeFileSync(path.join(proj, 'Dockerfile'), 'FROM node:latest\nCOPY . .\n');
 
   console.log('\napp');
+  await t('preload accepts nested event channels', async () => {
+    let api;
+    const registered = [];
+    const electron = {
+      contextBridge: { exposeInMainWorld: (name, value) => { if (name === 'phantom') api = value; } },
+      ipcRenderer: { on: (channel) => registered.push(channel), invoke: async () => ({ __ok: true }) }
+    };
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'main', 'preload.js'), 'utf8'), {
+      require: (name) => {
+        assert(name === 'electron', 'preload only imports Electron');
+        return electron;
+      },
+      process: { platform: process.platform },
+      console
+    });
+    api.on('agent:accounts:changed', () => {});
+    assert(registered.includes('agent:accounts:changed'), 'nested channel listener registered');
+    return 'agent account events accepted';
+  });
   await t('app:info reports coding agent CLIs', async () => {
     const info = await call('app:info');
     for (const id of ['claude', 'copilot', 'codex']) assert(typeof info.tools[id] === 'boolean', `${id} availability`);
     return ['claude', 'copilot', 'codex'].map((id) => `${id}:${info.tools[id] ? 'yes' : 'no'}`).join(' ');
+  });
+  await t('agent runtimes strip API credentials', async () => {
+    const env = subscriptionEnvironment({
+      PATH: 'agent-test-path', OPENAI_API_KEY: 'secret', CODEX_API_KEY: 'secret',
+      ANTHROPIC_API_KEY: 'secret', COPILOT_GITHUB_TOKEN: 'secret', GITHUB_TOKEN: 'secret',
+      GEMINI_API_KEY: 'secret', SENTRY_AUTH_TOKEN: 'secret', AWS_SECRET_ACCESS_KEY: 'secret',
+      CLAUDE_CODE_USE_BEDROCK: '1', ELECTRON_RUN_AS_NODE: '1'
+    });
+    assert(env.PATH === 'agent-test-path', 'preserve runtime PATH');
+    for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'ANTHROPIC_API_KEY', 'COPILOT_GITHUB_TOKEN', 'GITHUB_TOKEN', 'GEMINI_API_KEY', 'SENTRY_AUTH_TOKEN', 'AWS_SECRET_ACCESS_KEY', 'CLAUDE_CODE_USE_BEDROCK', 'ELECTRON_RUN_AS_NODE']) {
+      assert(!(key in env), `remove ${key}`);
+    }
+    return 'API credentials removed; PATH preserved';
+  });
+  await t('Copilot quota normalization supports credits and unlimited windows', async () => {
+    const quota = normalizeCopilotQuota({
+      login: 'phantom-user',
+      copilot_plan: 'individual',
+      token_based_billing: true,
+      quota_reset_date_utc: '2026-07-01T00:00:00Z',
+      quota_snapshots: {
+        premium_interactions: { entitlement: 1000, remaining: 250, credits_used: 750, percent_remaining: 25 },
+        chat: { unlimited: true },
+        completions: { entitlement: 0, has_quota: false }
+      }
+    });
+    assert(quota.available && quota.login === 'phantom-user', 'include the authenticated GitHub identity');
+    assert(quota.windows.length === 2, 'omit quota categories with no allowance');
+    assert(quota.windows[0].label === 'AI credits' && quota.windows[0].remaining === 250, 'preserve AI credit remaining');
+    assert(quota.windows[1].unlimited, 'preserve unlimited quota');
+    return 'identity, AI credit balance, reset date, and unlimited quota normalized';
+  });
+  await t('Copilot legacy quota normalization clamps exhausted balances and rejects missing data', async () => {
+    const quota = normalizeCopilotQuota({
+      quota_snapshots: {
+        premium_interactions: { entitlement: 300, remaining: -25, credits_used: 325, has_quota: false },
+        chat: { percent_remaining: 44.6 }
+      }
+    });
+    assert(quota.windows[0].label === 'Premium requests', 'label legacy usage accurately');
+    assert(quota.windows[0].remaining === 0 && quota.windows[0].overage === 25, 'show exhaustion and overage');
+    assert(quota.windows[1].percentRemaining === 44.6, 'preserve percent-only quotas');
+    try { normalizeCopilotQuota({ quota_snapshots: {} }); }
+    catch { return 'legacy balances and missing quota data handled'; }
+    throw new Error('missing quota data accepted');
+  });
+  await t('subscription accounts use isolated provider profiles', async () => {
+    const initial = await call('agent:accounts:list');
+    assert(initial.providers.copilot[0].id === 'default', 'default login is available');
+    const added = await call('agent:accounts:add', 'copilot', 'Secondary GitHub');
+    const profile = added.providers.copilot.find((item) => item.name === 'Secondary GitHub');
+    assert(profile && added.active.copilot === profile.id, 'new profile becomes active');
+    const accountEnv = await call('agent:accounts:environment', 'copilot', profile.id);
+    assert(accountEnv.env.COPILOT_HOME === path.join(dataDir, 'agent-profiles', 'copilot', profile.id), 'Copilot uses isolated home');
+    assert(accountEnv.unsetEnv.includes('GITHUB_TOKEN') || !process.env.GITHUB_TOKEN, 'login environment clears ambient API credentials');
+    const removed = await call('agent:accounts:remove', 'copilot', profile.id);
+    assert(!removed.providers.copilot.some((item) => item.id === profile.id), 'removed profile is no longer listed');
+    assert(removed.active.copilot === 'default', 'active profile falls back to default');
+    assert(!fs.existsSync(accountEnv.env.COPILOT_HOME), 'isolated profile data is removed');
+    try { await call('agent:accounts:remove', 'copilot', '..\\outside'); }
+    catch { return 'profiles isolated and invalid profile IDs rejected'; }
+    throw new Error('invalid account identifier accepted');
+  });
+  await t('agent rejects unsupported provider', async () => {
+    try { await call('agent:create', 'api', proj); }
+    catch (error) { return error.message; }
+    throw new Error('unsupported provider accepted');
+  });
+  await t('agent model settings validate by provider', async () => {
+    const codex = agentOptions('codex', { model: 'gpt-test', reasoningEffort: 'high', webSearchMode: 'cached' });
+    assert(codex.model === 'gpt-test' && codex.reasoningEffort === 'high' && codex.webSearchMode === 'cached', 'preserve Codex settings');
+    try { agentOptions('copilot', { reasoningEffort: 'persistent' }); }
+    catch (error) { return error.message; }
+    throw new Error('invalid reasoning effort accepted');
+  });
+  await t('agent execution and permission modes validate by provider', async () => {
+    const copilot = agentOptions('copilot', { agentMode: 'plan', permissionMode: 'project-scoped', enableMcp: true });
+    const assisted = agentOptions('copilot', { permissionMode: 'assisted' });
+    const codex = agentOptions('codex', { agentMode: 'autopilot' });
+    assert(copilot.agentMode === 'plan' && copilot.permissionMode === 'project-scoped', 'preserve Copilot modes');
+    assert(copilot.enableMcp, 'preserve Copilot MCP opt-in');
+    assert(assisted.permissionMode === 'assisted', 'preserve Copilot assisted permissions');
+    assert(codex.agentMode === 'autopilot' && codex.permissionMode === 'manual', 'preserve Codex mode and manual permissions');
+    for (const [provider, options] of [
+      ['copilot', { agentMode: 'unrestricted' }],
+      ['copilot', { permissionMode: 'allow-all' }],
+      ['codex', { permissionMode: 'assisted' }],
+      ['codex', { permissionMode: 'project-scoped' }],
+      ['codex', { enableMcp: true }]
+    ]) {
+      try { agentOptions(provider, options); }
+      catch { continue; }
+      throw new Error(`${provider} accepted unsupported agent options`);
+    }
+    return 'project-scoped Copilot permissions accepted; unsupported and allow-all policies rejected';
+  });
+  await t('assisted permissions auto-approve only safe, unmanaged reads', async () => {
+    const request = { kind: 'read', path: path.join(proj, 'src', 'a.js') };
+    const approved = { assistedApprovalAssessment: { status: 'completed', recommendation: 'approve' } };
+    assert(assistedReadApproval(request, approved, proj), 'safe project read should use the assisted recommendation');
+    assert(!assistedReadApproval({ kind: 'shell' }, approved, proj), 'shell must remain manual');
+    assert(!assistedReadApproval({ ...request, path: path.resolve(proj, '..', 'outside.txt') }, approved, proj), 'reads outside the project must remain manual');
+    assert(!assistedReadApproval({ ...request, requestSandboxBypass: true }, approved, proj), 'sandbox bypass must remain manual');
+    assert(!assistedReadApproval({ ...request, managedApprovalRequired: true }, approved, proj), 'managed approval must remain manual');
+    assert(!assistedReadApproval(request, { assistedApprovalAssessment: { status: 'completed', recommendation: 'requireApproval' } }, proj), 'unsafe read must remain manual');
+    return 'only safety-approved reads inside the project are auto-approved';
+  });
+  await t('project-scoped permissions approve only in-project file reads and writes', async () => {
+    const read = { kind: 'read', path: path.join(proj, 'src', 'a.js') };
+    const write = { kind: 'write', fileName: path.join(proj, 'src', 'new.js') };
+    assert(projectScopedApproval(read, {}, proj), 'project file read should be auto-approved');
+    assert(projectScopedApproval(write, {}, proj), 'new file in existing project directory should be auto-approved');
+    assert(!projectScopedApproval({ kind: 'write', fileName: path.resolve(proj, '..', 'outside.js') }, {}, proj), 'out-of-project write must remain manual');
+    assert(!projectScopedApproval({ kind: 'write', fileName: write.fileName, requestSandboxBypass: true }, {}, proj), 'sandbox bypass must remain manual');
+    assert(!projectScopedApproval({ kind: 'read', path: read.path, managedApprovalRequired: true }, {}, proj), 'managed permission must remain manual');
+    assert(!projectScopedApproval(read, { promptRequest: { managedApprovalRequired: true } }, proj), 'managed prompt context must remain manual');
+    assert(!projectScopedApproval({ kind: 'shell', command: 'echo no' }, {}, proj), 'shell commands must remain manual');
+    assert(!projectScopedApproval({ kind: 'url', url: 'https://example.com' }, {}, proj), 'network requests must remain manual');
+    assert(!projectScopedApproval({
+      kind: 'write', fileName: write.fileName,
+      fileEdits: [{ before: { path: write.fileName }, after: { path: path.resolve(proj, '..', 'outside.js') } }]
+    }, {}, proj), 'moves involving out-of-project paths must remain manual');
+    return 'only unmanaged file operations within the project are auto-approved';
+  });
+  await t('agent model discovery rejects unsupported providers', async () => {
+    try { await call('agent:models', 'codex', proj); }
+    catch (error) { return error.message; }
+    throw new Error('unsupported model catalog accepted');
+  });
+  await t('agent settings reject unsupported web search', async () => {
+    try { agentOptions('claude', { webSearchMode: 'live' }); }
+    catch (error) { return error.message; }
+    throw new Error('unsupported web search mode accepted');
+  });
+  await t('orchestrator accepts tagged and JSON-formatted actions', async () => {
+    const { FLOW_ACTION_TAG, parseFlowAction } = await import('../renderer/js/core/flow-protocol.mjs');
+    const tagged = parseFlowAction(`Plan\n<${FLOW_ACTION_TAG}>{"action":"delegate","summary":"Split work"}</${FLOW_ACTION_TAG}>`);
+    const fenced = parseFlowAction('```json\n{"action":"complete","finalResponse":"Done"}\n```');
+    const plain = parseFlowAction('{"action":"ask_user","question":"Which target?"}');
+    assert(tagged.action.action === 'delegate' && tagged.visibleText === 'Plan', 'tagged action and visible summary');
+    assert(fenced.action.action === 'complete', 'JSON code fence fallback');
+    assert(plain.action.action === 'ask_user', 'plain JSON fallback');
+    try { parseFlowAction('No structured action here.'); }
+    catch (error) { return error.message; }
+    throw new Error('unstructured response accepted');
+  });
+  await t('Claude workflow provider is recognized', async () => {
+    try { await call('agent:create', 'claude', ''); }
+    catch (error) {
+      assert(error.message.includes('Open a project'), 'Claude should pass provider validation');
+      return error.message;
+    }
+    throw new Error('empty project path accepted');
   });
 
   console.log('\nfs / store');
@@ -47,8 +224,39 @@ const assert = (c, m) => { if (!c) throw new Error('assert: ' + m); };
   await t('fs:write + read', async () => { const p = path.join(proj, 'x.txt'); await call('fs:write', p, 'hello\n'); const r = await call('fs:read', p); assert(r.content === 'hello\n', 'content'); fs.unlinkSync(p); return r.eol; });
   await t('fs:walk', async () => (await call('fs:walk', proj)).length + ' files');
   await t('fs:rename refuses overwrite', async () => { try { await call('fs:rename', path.join(proj, 'config.js'), path.join(proj, 'package.json')); } catch (e) { return e.message; } throw new Error('no error'); });
+  await t('Agent Flow saves and loads from the project directory', async () => {
+    const workflow = { name: 'Test flow', nodes: [{ id: 'task', type: 'input' }], edges: [] };
+    assert(await call('flow:load', proj) === null, 'new project has no saved flow');
+    await call('flow:save', proj, workflow);
+    await call('flow:save', proj, { ...workflow, name: 'Updated test flow' });
+    const saved = await call('flow:load', proj);
+    assert(saved.name === 'Updated test flow' && JSON.stringify(saved.nodes) === JSON.stringify(workflow.nodes), 'saved workflow replaces prior version');
+    assert(fs.existsSync(path.join(proj, '.phantom', 'agent-flow.json')), 'workflow file is in project');
+    return '.phantom/agent-flow.json';
+  });
+  await t('Agent Flow rejects invalid project data', async () => {
+    try { await call('flow:save', proj, { nodes: 'not-an-array', edges: [] }); }
+    catch (error) { return error.message; }
+    throw new Error('invalid workflow accepted');
+  });
   await t('store set/get', async () => { await call('store:set', 'layouts', { a: 1 }); const v = await call('store:get', 'layouts'); assert(v.a === 1, 'v'); return JSON.stringify(v); });
   await t('store rejects bad key', async () => { try { await call('store:set', '../x', 1); } catch (e) { return e.message; } throw new Error('accepted'); });
+  await t('store reports durable write failures', async () => {
+    const storeDir = path.join(dataDir, 'store');
+    const backupDir = path.join(dataDir, `store-test-backup-${process.pid}`);
+    fs.renameSync(storeDir, backupDir);
+    fs.writeFileSync(storeDir, 'block writes');
+    try {
+      await call('store:set', 'checkpoint-test', { saved: true });
+      throw new Error('failed write was reported as successful');
+    } catch (error) {
+      assert(['EEXIST', 'ENOTDIR'].includes(error.code), `unexpected error: ${error.message}`);
+      return `write failure surfaced (${error.code})`;
+    } finally {
+      fs.unlinkSync(storeDir);
+      fs.renameSync(backupDir, storeDir);
+    }
+  });
 
   console.log('\npty');
   await t('pty:spawn + echo', async () => {

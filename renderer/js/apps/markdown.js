@@ -4,25 +4,7 @@ import { call, bus } from '../core/api.js';
 import { docs } from '../core/docs.js';
 import { prompt, fail } from '../core/ui.js';
 import { project } from '../core/project.js';
-
-function render(md) {
-  if (window.marked && window.DOMPurify) {
-    const html = window.marked.parse(md, { gfm: true, breaks: false });
-    return window.DOMPurify.sanitize(html, { USE_PROFILES: { html: true }, FORBID_TAGS: ['style', 'form', 'input', 'iframe'], FORBID_ATTR: ['style'] });
-  }
-  // Fallback: minimal safe renderer (headings, code, lists, emphasis, links).
-  const lines = esc(md).split('\n'); let out = ''; let code = false;
-  for (const l of lines) {
-    if (/^```/.test(l)) { out += code ? '</code></pre>' : '<pre><code>'; code = !code; continue; }
-    if (code) { out += l + '\n'; continue; }
-    const m = /^(#{1,6})\s+(.*)/.exec(l);
-    if (m) out += `<h${m[1].length}>${m[2]}</h${m[1].length}>`;
-    else if (/^\s*[-*]\s+/.test(l)) out += `<li>${l.replace(/^\s*[-*]\s+/, '')}</li>`;
-    else if (!l.trim()) out += '<br>';
-    else out += `<p>${l.replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/\*([^*]+)\*/g, '<i>$1</i>')}</p>`;
-  }
-  return out;
-}
+import { renderMarkdown } from '../core/markdown.js';
 
 export default {
   id: 'markdown', title: 'Markdown', icon: 'markdown', desc: 'Live markdown preview', size: [640, 620], min: [300, 200],
@@ -40,7 +22,7 @@ export default {
       if (d) text = d.getValue();
       else { try { const r = await call('fs:read', path); text = r.content || ''; } catch (e) { body.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; } }
       const sc = body.scrollTop;
-      body.innerHTML = render(text);
+      body.innerHTML = renderMarkdown(text, { allowImages: true });
       // Resolve relative links: open .md/.code files inside PHANTOM, external links in the browser.
       body.querySelectorAll('a[href]').forEach((a) => a.addEventListener('click', (e) => {
         e.preventDefault();

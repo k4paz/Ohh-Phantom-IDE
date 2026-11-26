@@ -7,10 +7,10 @@ const path = require('path');
 
 const SERVICES = [
   'app', 'store', 'fs', 'watch', 'pty', 'sys', 'proc', 'net', 'git', 'search',
-  'http', 'db', 'ssh', 'audit', 'tasks', 'debug', 'arch', 'logs', 'collab', 'events'
+  'http', 'db', 'ssh', 'audit', 'tasks', 'debug', 'arch', 'logs', 'collab', 'events', 'agents', 'flow'
 ];
 
-const CHANNEL_RE = /^[a-z]+:[a-zA-Z]+$/;
+const CHANNEL_RE = /^[a-z]+:[a-zA-Z]+(?::[a-zA-Z][a-zA-Z-]*)*$/;
 
 function createCore({ dataDir, emit, platformHooks = {} }) {
   const bus = new EventEmitter();

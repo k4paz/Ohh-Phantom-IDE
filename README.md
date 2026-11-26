@@ -5,11 +5,11 @@
 
 PHANTOM is a desktop IDE that works like a hacker workstation. It runs as a small operating system of floating windows: editors, terminals, monitors, network tools, Git, databases, a debugger and security scanners. You arrange them however you like across four virtual workspaces.
 
-Everything is real: shells run in a real PTY, monitors read live kernel data, Git uses your Git binary, the debugger speaks the Chrome DevTools Protocol to Node, and the audits run on your project locally. PHANTOM itself needs no cloud services or API keys. Its optional Agents hub launches installed provider CLIs in local terminals; those CLIs handle their own sign-in and provider access.
+Everything is real: shells run in a real PTY, monitors read live kernel data, Git uses your Git binary, the debugger speaks the Chrome DevTools Protocol to Node, and the audits run on your project locally. The Agents hub uses the Copilot SDK and Codex SDK with saved provider sign-ins, plus Claude Code in a project terminal. PHANTOM does not request or store provider API keys and removes API-key environment variables before agent runs. Sign in with each provider's subscription account; PHANTOM relies on the provider's saved login and does not inspect its cached credential type.
 
 ## Install & run
 
-You need **Node.js 20.17+** and **git**. These are optional but recommended: `ripgrep` (fast search) and an OpenSSH client (`ssh`, which Windows 10/11 already includes).
+You need **Node.js 20.19+ or 22.12+** and **git**. These are optional but recommended: `ripgrep` (fast search) and an OpenSSH client (`ssh`, which Windows 10/11 already includes).
 
 ```bash
 npm install      # Electron, Monaco, xterm.js, node-pty…  (no git-hosted packages, no rebuild step)
@@ -77,7 +77,12 @@ How it works:
 
 ## Tools
 
-- **Agents**: launch Claude Code, GitHub Copilot CLI, or Codex in project-scoped terminals. Claude uses manual permission mode; Codex uses a read-only sandbox and requests approval for escalations. Provider sign-in and prompts remain with each CLI; PHANTOM does not pass auto-approve or bypass flags.
+- **Projects**: open folders, create project directories, and revisit or remove recent projects from one window.
+- **Window shortcuts**: Ctrl+1-9 focuses the matching window in the current taskbar list; Ctrl+Shift+1-4 switches workspaces; Ctrl+Tab / Ctrl+Shift+Tab cycles windows; Ctrl+Shift+D duplicates the focused window; Ctrl+Shift+R closes every other window.
+- **Desktop viewport**: pan the wallpaper and app windows together without changing their scale; reset the viewport position from the desktop control.
+- **Agent Flow recovery**: unfinished runs save per-project checkpoints in local app storage, outside the project repository. Resume continues from the latest completed step; interrupted agent or build steps may be retried.
+- **Agents**: in-app Copilot SDK and Codex SDK chats use saved provider sign-ins; API-key environment variables are stripped. Use the Subscriptions dashboard to create isolated local sign-in profiles for Copilot, Codex, and Claude Code, switch accounts, and review PHANTOM-tracked request/character totals plus provider-reported token totals where available. Copilot quota is fetched via GitHub's `copilot_internal/user` endpoint using the active `gh` CLI account, which may differ from a saved Copilot CLI profile; this endpoint is internal and may change. Copilot device-code sign-in is the default. Copilot asks before permissioned tool actions, and Codex runs read-only with on-request approval. Claude Code runs in a project terminal under the selected account profile. Copilot project MCP configuration can be enabled per chat with explicit opt-in; MCP actions still request approval. Codex and Claude Code use their native CLI configuration and approval flows.
+- **Agent Flow**: build per-project workflows saved to `.phantom/agent-flow.json`, alongside the existing reusable presets. Apply built-in workflow templates or save, reuse, and delete your own presets. Right-click empty space in the Explorer and choose **Open Agent Flow Here** to add that folder as task context. Left-drag nodes to move them, left-drag empty canvas to marquee-select nodes and wires, Ctrl/Cmd-click to toggle individual nodes or wires, middle- or right-drag to pan, and use the mouse wheel to zoom. Ctrl/Cmd+Z undoes and Ctrl/Cmd+Shift+Z (or Ctrl/Cmd+Y) redoes workflow edits; text fields retain their native undo behavior. Press Delete/Backspace to remove selected agent nodes and/or connections; built-in workflow nodes stay in place. Drag output ports onto input ports to connect agents; connect agents, the compiler, and/or the orchestrator to Final Response to collect their results. Select one node to edit its task and flow function; multi-select agent nodes to edit shared provider, mode, and permission settings. Choose a Simple Agent Role preset (Planner, FrontEnd, Backend, Debugger, Orchestrator, BrainStormer, or SecurityEngineer), or switch to Advanced Agent Role to edit custom instructions and reasoning effort. Interactive, Plan, and Autopilot modes are available per node; Plan is read-only, and Autopilot is limited to the active project while protected actions remain gated. Copilot permissions include Manual, Assisted read approvals, and Project-scoped file access; Project-scoped auto-approves reads and writes inside the active project while shell, network, sandbox-bypass, managed, and out-of-project requests remain approval-gated. Unrestricted Allow All is not available. Codex nodes can optionally use cached or live web search. The orchestrator can pause for user clarification, delegate scoped assignments to worker nodes, run detected or selected build/test commands, send implementation and compiler findings to Plan-mode reviewers, and dispatch targeted worker revisions. Responses without a valid action block get one format-retry before the workflow stops with an error. The maximum number of revision rounds is configurable on the orchestrator; the final response reports the latest review and verification results.
 - **Live Session**: host or join encrypted peer-to-peer sessions, edit shared files concurrently with live cursors, and chat. The file remains on its owner's computer; guests request saves from the owner.
 - **Editor** (Monaco): tabs, split groups (Ctrl+\\, drag tabs between groups or windows), IntelliSense for JS/TS/JSON/CSS/HTML, word-based completion everywhere, shared models across all editor windows, external-change detection with conflict warning, breakpoints (gutter/F9), optional autosave.
 - **Terminal** (xterm.js + node-pty): real shells, 256-colour/truecolor, scrollback search (Ctrl+Shift+F), clickable links, copy/paste (Ctrl+Shift+C/V). The working directory is tracked so layouts reopen terminals in the right folder.
@@ -99,7 +104,7 @@ How it works:
 - **Architecture**: a force-directed import graph for JS/TS (including tsconfig path aliases), Python, Go, Rust and CSS. Directory clustering, cycle detection (Tarjan SCC), most-imported/most-dependent lists, optional external packages. Double-click a module to open it.
 - **Markdown / JSON viewers**: live markdown preview (sanitised with DOMPurify, follows unsaved edits) and a collapsible JSON tree with path copy, filtering and JSON Lines support.
 
-Global keys: **F5** run · **Ctrl+Shift+P** command palette · **Ctrl+P** go to file (`file:line`) · **Ctrl+O** open folder · **Ctrl+`** terminal · **Ctrl+Shift+F/E/G** search/explorer/git · **Ctrl+,** settings · **Ctrl+Shift+W** close window · **F11** fullscreen.
+Global keys: **F5** run · **F12** developer tools · **Ctrl+W** close focused window (**Ctrl+Shift+W** also works) · **Ctrl+Alt+Shift+Arrow** snap the focused window · **Ctrl+Shift+P** command palette · **Ctrl+P** go to file (`file:line`) · **Ctrl+O** open folder · **Ctrl+`** terminal · **Ctrl+Shift+F/E/G** search/explorer/git · **Ctrl+,** settings · **F11** fullscreen (Windows enters hard kiosk; **Alt+Tab** cycles PHANTOM windows; **Ctrl+Shift+F12** exits).
 
 Themes: PHANTOM, FSOCIETY, E CORP, AMBER CRT, DARK ARMY, ICEBREAKER, GHOST. You can also set a custom accent, glow intensity, scanlines and grid.
 
@@ -112,7 +117,7 @@ main/
   registry.js      builds the backend core and loads services
   util.js          exec/walk/which helpers (no Electron imports)
   services/*.js    one module per domain: fs, watch, pty, sys, proc, net, git, search, http,
-                   db, ssh, audit, tasks, debug, arch, logs, events, collab, store, app
+                   db, ssh, audit, tasks, debug, arch, logs, events, collab, store, app, agents
 renderer/
   index.html, css/ base · window manager · tool styles
   js/core/         api (bridge, shared pollers, telemetry), wm (window manager), shell (chrome,

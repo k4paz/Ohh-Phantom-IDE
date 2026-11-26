@@ -1,8 +1,7 @@
 // Process manager: sortable/filterable table, tree view, details, signals.
 import { h, esc, bytes, dur } from '../core/dom.js';
 import { call, poll } from '../core/api.js';
-import { menu, confirm, toast, fail } from '../core/ui.js';
-import { wm } from '../core/wm.js';
+import { showProcessMenu, signalProcess } from '../core/proc-menu.js';
 
 export default {
   id: 'procs', title: 'Processes', icon: 'proc', desc: 'Running process monitor', size: [760, 520], min: [420, 220],
@@ -59,20 +58,10 @@ export default {
       const tr = e.target.closest('tr[data-pid]'); if (!tr) return; e.preventDefault();
       selPid = Number(tr.dataset.pid); render(); showDetail();
       const p = data.procs.find((x) => x.pid === selPid);
-      menu(e.clientX, e.clientY, [
-        { header: `${p.name} (${p.pid})` },
-        { label: 'Terminate (SIGTERM)', danger: true, action: () => kill('SIGTERM') },
-        { label: 'Kill (SIGKILL)', danger: true, action: () => kill('SIGKILL') },
-        { label: 'Interrupt (SIGINT)', action: () => kill('SIGINT') },
-        { label: 'Suspend (SIGSTOP)', action: () => kill('SIGSTOP') },
-        { label: 'Continue (SIGCONT)', action: () => kill('SIGCONT') },
-        { label: 'Hang up (SIGHUP)', action: () => kill('SIGHUP') },
-        '-',
-        { label: 'Show sockets', action: () => wm.open('net', { state: { tab: 'conns', filter: String(p.pid) } }) },
-        { label: 'Filter to children', action: () => { tree = true; treeBtn.classList.add('on'); render(); } },
-        { label: 'Copy command line', action: () => navigator.clipboard.writeText(p.command) },
-        { label: 'Copy PID', action: () => navigator.clipboard.writeText(String(p.pid)) }
-      ]);
+      if (p) showProcessMenu(e, p, {
+        refresh: () => pollH.now(),
+        onFilterChildren: () => { tree = true; treeBtn.classList.add('on'); render(); }
+      });
     });
 
     async function showDetail() {
@@ -88,9 +77,7 @@ export default {
 
     async function kill(sig) {
       const p = data && data.procs.find((x) => x.pid === selPid); if (!p) return;
-      const destructive = sig === 'SIGKILL' || sig === 'SIGTERM';
-      if (destructive && !(await confirm(sig === 'SIGKILL' ? 'Kill process' : 'Terminate process', `Send ${sig} to ${p.name} (pid ${p.pid}, user ${p.user})?\n${p.command.slice(0, 200)}${sig === 'SIGKILL' ? '\n\nSIGKILL cannot be caught — unsaved work in that process will be lost.' : ''}`, { danger: true, ok: sig }))) return;
-      try { await call('proc:kill', p.pid, sig); toast(`${sig} → ${p.name} (${p.pid})`); pollH.now(); } catch (e) { fail(e, 'SIGNAL'); }
+      await signalProcess(p, sig, () => pollH.now());
     }
 
     filterInp.addEventListener('input', () => { filter = filterInp.value; render(); win.save(); });

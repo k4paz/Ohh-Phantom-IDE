@@ -26,9 +26,14 @@ module.exports = (core) => {
       const f = file(key);
       const json = JSON.stringify(value);
       if (json && json.length > 20 * 1024 * 1024) throw new Error('Value too large');
-      cache.set(key, value);
       const prev = writes.get(key) || Promise.resolve();
-      const next = prev.then(() => writeJsonAtomic(f, value)).catch((e) => core.log('error', 'store write failed: ' + e.message));
+      const next = prev.catch(() => {}).then(() => writeJsonAtomic(f, value)).then(() => {
+        cache.set(key, value);
+        return true;
+      }).catch((e) => {
+        core.log('error', 'store write failed: ' + e.message);
+        throw e;
+      });
       writes.set(key, next);
       await next;
       return true;

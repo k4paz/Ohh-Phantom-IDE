@@ -66,12 +66,17 @@ export class WindowManager {
   constructor() {
     this.apps = new Map(); this.windows = []; this.active = 0; this.focused = null; this.z = 10;
     this.history = []; // focus order (most recent last)
+    this.cycleOrder = null;
+    this.cycling = false;
   }
 
   init(desktop) {
     this.desk = desktop;
     this.preview = desktop.querySelector('#snap-preview');
     this.guides = desktop.querySelector('#guides');
+    this.world = h('div#window-viewport');
+    this.desk.insertBefore(this.world, this.preview);
+    this.viewport = { zoom: 1, panX: 0, panY: 0 };
     new ResizeObserver(() => this.onDesktopResize()).observe(desktop);
     this.lastDesk = { w: desktop.clientWidth, h: desktop.clientHeight };
   }
@@ -84,12 +89,32 @@ export class WindowManager {
 
   get W() { return this.desk.clientWidth; }
   get H() { return this.desk.clientHeight; }
+  viewRect() {
+    const { zoom, panX, panY } = this.viewport;
+    return { x: -panX / zoom, y: -panY / zoom, w: this.W / zoom, h: this.H / zoom };
+  }
+  toWorld(clientX, clientY, deskRect = this.desk.getBoundingClientRect()) {
+    const { zoom, panX, panY } = this.viewport;
+    return {
+      x: (clientX - deskRect.left - panX) / zoom,
+      y: (clientY - deskRect.top - panY) / zoom
+    };
+  }
+  setViewportTransform(_zoom, panX, panY) {
+    this.viewport = { zoom: 1, panX, panY };
+    this.world.style.transform = `translate(${panX}px, ${panY}px)`;
+    for (const win of this.windows) {
+      if (win.max) this.render(win);
+      else if (win.snapZone) { win.rect = this.zoneRect(win.snapZone); this.render(win); }
+    }
+    bus.emit('wm:viewport', this.viewport);
+  }
 
   // ───────── lifecycle ─────────
   async open(appId, opts = {}) {
     const app = this.apps.get(appId);
     if (!app) { toast(`unknown tool: ${appId}`, 'error'); return null; }
-    if (app.singleton) {
+    if (app.singleton && !opts.allowDuplicate) {
       const ex = this.windows.find((w) => w.app.id === appId);
       if (ex) { if (ex.ws !== this.active) this.switchWorkspace(ex.ws); this.restore(ex); this.focus(ex); if (opts.state && ex.instance && ex.instance.apply) ex.instance.apply(opts.state); return ex; }
     }
@@ -97,7 +122,7 @@ export class WindowManager {
     if (opts.rect) win.rect = { ...opts.rect };
     else win.rect = this.placeNew(app.size);
     this.windows.push(win);
-    this.desk.appendChild(win.el);
+    this.world.appendChild(win.el);
     win.el.classList.add('opening');
     setTimeout(() => win.el.classList.remove('opening'), 200);
     if (win.pinned) win.pinBtn.classList.add('on'), win.el.classList.add('pinned');
@@ -143,21 +168,38 @@ export class WindowManager {
     return true;
   }
 
+  async closeOthers(keep) {
+    if (!keep || keep.closed) return false;
+    for (const win of [...this.windows]) {
+      if (win === keep) continue;
+      if (!(await this.close(win))) {
+        toast(`Could not close "${win.title}".`, 'warn', 'WINDOWS');
+        return false;
+      }
+    }
+    if (keep && !keep.closed) {
+      if (keep.ws !== this.active) this.switchWorkspace(keep.ws);
+      this.restore(keep);
+      this.focus(keep);
+    }
+    return true;
+  }
+
   placeNew([w, hgt]) {
-    const W = this.W; const H = this.H;
+    const view = this.viewRect(); const W = view.w; const H = view.h;
     w = Math.min(w, W - 20); hgt = Math.min(hgt, H - 20);
     // Cascade from the focused window, otherwise centre-ish with jitter.
     const vis = this.windows.filter((x) => x.visible);
     let x; let y;
     if (this.focused && this.focused.visible && !this.focused.max) { x = this.focused.rect.x + 28; y = this.focused.rect.y + 28; }
-    else { x = (W - w) / 2 + (vis.length % 5) * 24 - 48; y = (H - hgt) / 2.4 + (vis.length % 5) * 24 - 48; }
-    if (x + w > W - 4 || y + hgt > H - 4) { x = 20 + (vis.length % 6) * 24; y = 16 + (vis.length % 6) * 24; }
-    return { x: Math.max(0, Math.round(x)), y: Math.max(0, Math.round(y)), w: Math.round(w), h: Math.round(hgt) };
+    else { x = view.x + (W - w) / 2 + (vis.length % 5) * 24 - 48; y = view.y + (H - hgt) / 2.4 + (vis.length % 5) * 24 - 48; }
+    if (x + w > view.x + W - 4 || y + hgt > view.y + H - 4) { x = view.x + 20 + (vis.length % 6) * 24; y = view.y + 16 + (vis.length % 6) * 28; }
+    return { x: Math.max(view.x, Math.round(x)), y: Math.max(view.y, Math.round(y)), w: Math.round(w), h: Math.round(hgt) };
   }
 
   // ───────── rendering ─────────
   render(win) {
-    const r = win.max ? { x: 0, y: 0, w: this.W, h: this.H } : win.rect;
+    const r = win.max ? this.viewRect() : win.rect;
     const s = win.el.style;
     s.left = r.x + 'px'; s.top = r.y + 'px'; s.width = r.w + 'px'; s.height = r.h + 'px';
   }
@@ -174,6 +216,7 @@ export class WindowManager {
 
   focus(win) {
     if (!win || win.closed) return;
+    if (!this.cycling) this.cycleOrder = null;
     if (this.focused !== win) {
       if (this.focused) this.focused.el.classList.remove('focus');
       this.focused = win;
@@ -214,7 +257,7 @@ export class WindowManager {
       const a = win.el.getBoundingClientRect(); const b = btn.getBoundingClientRect();
       win.el.classList.add('minimizing');
       win.el.style.transformOrigin = '0 0';
-      win.el.style.transform = `translate(${b.left - a.left}px, ${b.top - a.top}px) scale(${b.width / a.width}, ${b.height / a.height})`;
+      win.el.style.transform = `translate(${(b.left - a.left) / this.viewport.zoom}px, ${(b.top - a.top) / this.viewport.zoom}px) scale(${b.width / a.width}, ${b.height / a.height})`;
       setTimeout(() => { win.el.classList.remove('minimizing'); win.el.style.transform = ''; win.min = true; this.sync(win); }, 180);
     } else { win.min = true; this.sync(win); }
     win.min = true;
@@ -248,16 +291,17 @@ export class WindowManager {
   }
 
   zoneRect(zone) {
-    const W = this.W; const H = this.H; const hw = Math.round(W / 2); const hh = Math.round(H / 2);
+    const view = this.viewRect();
+    const { x, y, w: W, h: H } = view; const hw = Math.round(W / 2); const hh = Math.round(H / 2);
     const t3 = Math.round(W / 3);
     return {
-      left: { x: 0, y: 0, w: hw, h: H }, right: { x: hw, y: 0, w: W - hw, h: H },
-      top: { x: 0, y: 0, w: W, h: hh }, bottom: { x: 0, y: hh, w: W, h: H - hh },
-      tl: { x: 0, y: 0, w: hw, h: hh }, tr: { x: hw, y: 0, w: W - hw, h: hh },
-      bl: { x: 0, y: hh, w: hw, h: H - hh }, br: { x: hw, y: hh, w: W - hw, h: H - hh },
-      l3: { x: 0, y: 0, w: t3, h: H }, c3: { x: t3, y: 0, w: t3, h: H }, r3: { x: 2 * t3, y: 0, w: W - 2 * t3, h: H },
-      center: { x: Math.round(W * 0.15), y: Math.round(H * 0.1), w: Math.round(W * 0.7), h: Math.round(H * 0.8) },
-      max: { x: 0, y: 0, w: W, h: H }
+      left: { x, y, w: hw, h: H }, right: { x: x + hw, y, w: W - hw, h: H },
+      top: { x, y, w: W, h: hh }, bottom: { x, y: y + hh, w: W, h: H - hh },
+      tl: { x, y, w: hw, h: hh }, tr: { x: x + hw, y, w: W - hw, h: hh },
+      bl: { x, y: y + hh, w: hw, h: H - hh }, br: { x: x + hw, y: y + hh, w: W - hw, h: H - hh },
+      l3: { x, y, w: t3, h: H }, c3: { x: x + t3, y, w: t3, h: H }, r3: { x: x + 2 * t3, y, w: W - 2 * t3, h: H },
+      center: { x: x + Math.round(W * 0.15), y: y + Math.round(H * 0.1), w: Math.round(W * 0.7), h: Math.round(H * 0.8) },
+      max: view
     }[zone];
   }
   snap(win, zone, quiet) {
@@ -285,24 +329,26 @@ export class WindowManager {
   tile() {
     const vis = this.windows.filter((w) => w.visible);
     if (!vis.length) return;
-    const n = vis.length; const cols = Math.ceil(Math.sqrt(n * (this.W / this.H) / 1.4)); const rows = Math.ceil(n / cols);
+    const view = this.viewRect();
+    const n = vis.length; const cols = Math.ceil(Math.sqrt(n * (view.w / view.h) / 1.4)); const rows = Math.ceil(n / cols);
     const gap = 6;
     vis.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x).forEach((w, i) => {
       const c = i % cols; const r = Math.floor(i / cols);
       const colsInRow = r === rows - 1 ? n - cols * (rows - 1) : cols;
-      const cw = (this.W - gap * (colsInRow + 1)) / colsInRow; const rh = (this.H - gap * (rows + 1)) / rows;
+      const cw = (view.w - gap * (colsInRow + 1)) / colsInRow; const rh = (view.h - gap * (rows + 1)) / rows;
       w.max = false; w.snapZone = null;
-      w.rect = { x: Math.round(gap + c * (cw + gap)), y: Math.round(gap + r * (rh + gap)), w: Math.round(cw), h: Math.round(rh) };
+      w.rect = { x: Math.round(view.x + gap + c * (cw + gap)), y: Math.round(view.y + gap + r * (rh + gap)), w: Math.round(cw), h: Math.round(rh) };
       this.animate(w); this.render(w); this.sync(w);
     });
     this.changed('tile');
   }
   cascade() {
     const vis = this.windows.filter((w) => w.visible).sort((a, b) => a.z - b.z);
+    const view = this.viewRect();
     vis.forEach((w, i) => {
       w.max = false; w.snapZone = null;
-      const ww = Math.min(w.app.size[0], this.W - 200); const hh = Math.min(w.app.size[1], this.H - 160);
-      w.rect = { x: 24 + (i % 10) * 30, y: 16 + (i % 10) * 28, w: ww, h: hh };
+      const ww = Math.min(w.app.size[0], view.w - 200); const hh = Math.min(w.app.size[1], view.h - 160);
+      w.rect = { x: view.x + 24 + (i % 10) * 30, y: view.y + 16 + (i % 10) * 28, w: ww, h: hh };
       this.animate(w); this.render(w); this.sync(w);
     });
     this.changed('cascade');
@@ -315,14 +361,25 @@ export class WindowManager {
   cycle(dir = 1) {
     const vis = this.windows.filter((w) => w.ws === this.active && !w.closed).sort((a, b) => a.id - b.id);
     if (!vis.length) return;
-    const i = vis.indexOf(this.focused);
-    const next = vis[(i + dir + vis.length) % vis.length];
-    this.restore(next); this.focus(next);
+    if (!this.cycleOrder || this.cycleOrder.length !== vis.length || vis.some((w) => !this.cycleOrder.includes(w))) {
+      this.cycleOrder = [...this.history.filter((w) => vis.includes(w)), ...vis.filter((w) => !this.history.includes(w))];
+    }
+    const ordered = this.cycleOrder;
+    const i = ordered.indexOf(this.focused);
+    const next = ordered[((i < 0 ? 0 : i) - dir + ordered.length) % ordered.length];
+    this.cycling = true;
+    try {
+      this.restore(next);
+      this.focus(next);
+    } finally {
+      this.cycling = false;
+    }
   }
 
   // ───────── drag & resize ─────────
   magnetEdges(win) {
-    const xs = [0, this.W]; const ys = [0, this.H];
+    const view = this.viewRect();
+    const xs = [view.x, view.x + view.w]; const ys = [view.y, view.y + view.h];
     for (const w of this.windows) {
       if (w === win || !w.visible || w.max) continue;
       xs.push(w.rect.x, w.rect.x + w.rect.w); ys.push(w.rect.y, w.rect.y + w.rect.h);
@@ -342,8 +399,9 @@ export class WindowManager {
   }
   showGuides(gx, gy) {
     this.guides.innerHTML = '';
-    if (gx !== null && gx !== undefined) this.guides.appendChild(h('i.v', { style: { left: gx + 'px' } }));
-    if (gy !== null && gy !== undefined) this.guides.appendChild(h('i.h', { style: { top: gy + 'px' } }));
+    const { zoom, panX, panY } = this.viewport;
+    if (gx !== null && gx !== undefined) this.guides.appendChild(h('i.v', { style: { left: `${panX + gx * zoom}px` } }));
+    if (gy !== null && gy !== undefined) this.guides.appendChild(h('i.h', { style: { top: `${panY + gy * zoom}px` } }));
   }
   detectZone(px, py) {
     if (!settings.snap) return null;
@@ -363,7 +421,8 @@ export class WindowManager {
     const p = this.preview;
     if (!zone) { p.classList.remove('on'); return; }
     const r = this.zoneRect(zone);
-    Object.assign(p.style, { left: r.x + 4 + 'px', top: r.y + 4 + 'px', width: r.w - 8 + 'px', height: r.h - 8 + 'px' });
+    const { zoom, panX, panY } = this.viewport;
+    Object.assign(p.style, { left: `${panX + r.x * zoom + 4}px`, top: `${panY + r.y * zoom + 4}px`, width: `${r.w * zoom - 8}px`, height: `${r.h * zoom - 8}px` });
     p.dataset.label = { max: 'MAXIMIZE', left: 'LEFT HALF', right: 'RIGHT HALF', bottom: 'BOTTOM HALF', tl: 'TOP LEFT', tr: 'TOP RIGHT', bl: 'BOTTOM LEFT', br: 'BOTTOM RIGHT' }[zone] || zone.toUpperCase();
     p.classList.add('on');
   }
@@ -372,11 +431,12 @@ export class WindowManager {
     e.preventDefault();
     const deskR = this.desk.getBoundingClientRect();
     const sx = e.clientX; const sy = e.clientY;
-    let r0 = { ...(win.max ? { x: 0, y: 0, w: this.W, h: this.H } : win.rect) };
+    let r0 = { ...(win.max ? this.viewRect() : win.rect) };
+    const startWorld = this.toWorld(sx, sy, deskR);
     let moved = false; let zone = null;
     const target = e.currentTarget; target.setPointerCapture(e.pointerId);
     const move = (ev) => {
-      const dx = ev.clientX - sx; const dy = ev.clientY - sy;
+      const dx = (ev.clientX - sx) / this.viewport.zoom; const dy = (ev.clientY - sy) / this.viewport.zoom;
       if (!moved) {
         if (Math.hypot(dx, dy) < 4) return;
         moved = true;
@@ -384,8 +444,9 @@ export class WindowManager {
         if (win.max || win.snapZone) {
           // Tear out of maximized/snapped state, keeping the grab point proportional.
           const rr = win.restoreRect || { w: win.app.size[0], h: win.app.size[1] };
-          const ratio = (sx - deskR.left - r0.x) / r0.w;
-          r0 = { x: Math.round(sx - deskR.left - ratio * rr.w), y: r0.y, w: rr.w, h: rr.h };
+          const ratioX = (startWorld.x - r0.x) / r0.w;
+          const ratioY = (startWorld.y - r0.y) / r0.h;
+          r0 = { x: Math.round(startWorld.x - ratioX * rr.w), y: Math.round(startWorld.y - ratioY * rr.h), w: rr.w, h: rr.h };
           win.max = false; win.snapZone = null; win.restoreRect = null;
           this.sync(win);
         }
@@ -394,11 +455,13 @@ export class WindowManager {
       let gx = null; let gy = null;
       if (settings.magnet > 0 && !ev.altKey) {
         const { xs, ys } = this.magnetEdges(win);
-        const mx = this.snapAxis(x, x + r0.w, xs, settings.magnet); if (mx) { x += mx.delta; gx = mx.at; }
-        const my = this.snapAxis(y, y + r0.h, ys, settings.magnet); if (my) { y += my.delta; gy = my.at; }
+        const threshold = settings.magnet / this.viewport.zoom;
+        const mx = this.snapAxis(x, x + r0.w, xs, threshold); if (mx) { x += mx.delta; gx = mx.at; }
+        const my = this.snapAxis(y, y + r0.h, ys, threshold); if (my) { y += my.delta; gy = my.at; }
       }
-      y = Math.max(0, Math.min(y, this.H - TITLE_H));
-      x = Math.max(-r0.w + 80, Math.min(x, this.W - 80));
+      const view = this.viewRect();
+      y = Math.max(view.y, Math.min(y, view.y + view.h - TITLE_H / this.viewport.zoom));
+      x = Math.max(view.x - r0.w + 80 / this.viewport.zoom, Math.min(x, view.x + view.w - 80 / this.viewport.zoom));
       win.rect = { x: Math.round(x), y: Math.round(y), w: r0.w, h: r0.h };
       this.render(win);
       this.showGuides(gx, gy);
@@ -428,14 +491,15 @@ export class WindowManager {
     document.body.classList.add('wm-busy'); win.el.classList.add('resizing');
     win.snapZone = null;
     const move = (ev) => {
-      const dx = ev.clientX - sx; const dy = ev.clientY - sy;
+      const dx = (ev.clientX - sx) / this.viewport.zoom; const dy = (ev.clientY - sy) / this.viewport.zoom;
       let { x, y, w, h: hh } = r0; let gx = null; let gy = null;
-      const t = ev.altKey ? 0 : settings.magnet;
+      const t = ev.altKey ? 0 : settings.magnet / this.viewport.zoom;
       const near = (v, cands) => { for (const c of cands) if (Math.abs(c - v) <= t) return c; return null; };
       if (dir.includes('e')) { let right = r0.x + r0.w + dx; const c = near(right, edges.xs); if (c !== null) { right = c; gx = c; } w = Math.max(minW, right - x); }
-      if (dir.includes('s')) { let bottom = r0.y + r0.h + dy; const c = near(bottom, edges.ys); if (c !== null) { bottom = c; gy = c; } hh = Math.max(minH, Math.min(bottom, this.H) - y); }
+      const view = this.viewRect();
+      if (dir.includes('s')) { let bottom = r0.y + r0.h + dy; const c = near(bottom, edges.ys); if (c !== null) { bottom = c; gy = c; } hh = Math.max(minH, Math.min(bottom, view.y + view.h) - y); }
       if (dir.includes('w')) { let left = r0.x + dx; const c = near(left, edges.xs); if (c !== null) { left = c; gx = c; } left = Math.min(left, r0.x + r0.w - minW); w = r0.x + r0.w - left; x = left; }
-      if (dir.includes('n')) { let top = Math.max(0, r0.y + dy); const c = near(top, edges.ys); if (c !== null) { top = c; gy = c; } top = Math.min(top, r0.y + r0.h - minH); hh = r0.y + r0.h - top; y = top; }
+      if (dir.includes('n')) { let top = Math.max(view.y, r0.y + dy); const c = near(top, edges.ys); if (c !== null) { top = c; gy = c; } top = Math.min(top, r0.y + r0.h - minH); hh = r0.y + r0.h - top; y = top; }
       win.rect = { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(hh) };
       this.render(win);
       this.showGuides(gx, gy);
@@ -451,19 +515,19 @@ export class WindowManager {
   }
 
   onDesktopResize() {
-    const W = this.W; const H = this.H;
-    if (!W || !H) return;
+    const view = this.viewRect();
+    if (!view.w || !view.h) return;
     for (const w of this.windows) {
       if (w.max) this.render(w);
       else if (w.snapZone) { w.rect = this.zoneRect(w.snapZone); this.render(w); }
       else {
-        w.rect.w = Math.min(w.rect.w, W); w.rect.h = Math.min(w.rect.h, H);
-        w.rect.x = Math.max(-w.rect.w + 80, Math.min(w.rect.x, W - 80));
-        w.rect.y = Math.max(0, Math.min(w.rect.y, H - TITLE_H));
+        w.rect.w = Math.min(w.rect.w, view.w); w.rect.h = Math.min(w.rect.h, view.h);
+        w.rect.x = Math.max(view.x - w.rect.w + 80 / this.viewport.zoom, Math.min(w.rect.x, view.x + view.w - 80 / this.viewport.zoom));
+        w.rect.y = Math.max(view.y, Math.min(w.rect.y, view.y + view.h - TITLE_H / this.viewport.zoom));
         this.render(w);
       }
     }
-    this.lastDesk = { w: W, h: H };
+    this.lastDesk = { w: this.W, h: this.H };
   }
 
   // ───────── menus ─────────
@@ -473,11 +537,11 @@ export class WindowManager {
     menu(x, y, [
       { header: win.title },
       { label: 'Always on top', check: win.pinned, action: () => this.setPinned(win, !win.pinned) },
-      { label: win.max ? 'Restore' : 'Maximize', action: () => this.toggleMax(win), key: '⌃⌥↑' },
-      { label: 'Minimize', action: () => this.minimize(win), key: '⌃⌥↓' },
+      { label: win.max ? 'Restore' : 'Maximize', action: () => this.toggleMax(win), key: '⌃⌥⇧↑' },
+      { label: 'Minimize', action: () => this.minimize(win), key: '⌃⌥⇧↓' },
       '-',
-      { label: 'Snap left half', action: () => this.snap(win, 'left'), key: '⌃⌥←' },
-      { label: 'Snap right half', action: () => this.snap(win, 'right'), key: '⌃⌥→' },
+      { label: 'Snap left half', action: () => this.snap(win, 'left'), key: '⌃⌥⇧←' },
+      { label: 'Snap right half', action: () => this.snap(win, 'right'), key: '⌃⌥⇧→' },
       { label: 'Snap top / bottom', action: () => this.snap(win, win.snapZone === 'top' ? 'bottom' : 'top') },
       { label: 'Snap quarter', action: () => this.snap(win, ['tl', 'tr', 'br', 'bl'][(['tl', 'tr', 'br', 'bl'].indexOf(win.snapZone) + 1) % 4]) },
       { label: 'Snap thirds', action: () => this.snap(win, ['l3', 'c3', 'r3'][(['l3', 'c3', 'r3'].indexOf(win.snapZone) + 1) % 3]) },
@@ -485,21 +549,24 @@ export class WindowManager {
       '-',
       ...wsItems,
       '-',
-      { label: 'Duplicate window', action: () => this.duplicate(win), disabled: !!win.app.singleton },
+      { label: 'Duplicate window', action: () => this.duplicate(win) },
       { label: 'Rename…', action: async () => { const t = await prompt('Rename window', win.title); if (t !== null) win.setTitle(t.trim()); } },
       '-',
-      { label: 'Close', danger: true, action: () => this.close(win), key: '⌃⇧W' }
+      { label: 'Close', danger: true, action: () => this.close(win), key: '⌃W' }
     ]);
   }
   duplicate(win) {
     const state = win.instance && win.instance.serialize ? win.instance.serialize() : {};
-    return this.open(win.app.id, { state, rect: { ...win.rect, x: win.rect.x + 28, y: win.rect.y + 28 } });
+    return this.open(win.app.id, {
+      state, allowDuplicate: true,
+      rect: { ...win.rect, x: win.rect.x + 28, y: win.rect.y + 28 }
+    });
   }
 
   // ───────── persistence ─────────
   serialize() {
     return {
-      v: 1, active: this.active, desk: { w: this.W, h: this.H },
+      v: 1, active: this.active, desk: { w: this.W, h: this.H }, viewport: { ...this.viewport },
       windows: [...this.windows].sort((a, b) => a.z - b.z).map((w) => {
         let state = {};
         try { state = w.instance && w.instance.serialize ? w.instance.serialize() : {}; } catch (e) { console.error(e); }
@@ -512,6 +579,10 @@ export class WindowManager {
     if (replace && !(await this.closeAll())) return;
     const sx = layout.desk && layout.desk.w ? this.W / layout.desk.w : 1;
     const sy = layout.desk && layout.desk.h ? this.H / layout.desk.h : 1;
+    const viewport = layout.viewport || { zoom: 1, panX: 0, panY: 0 };
+    const panX = Number.isFinite(viewport.panX) ? viewport.panX * sx : 0;
+    const panY = Number.isFinite(viewport.panY) ? viewport.panY * sy : 0;
+    this.setViewportTransform(1, panX, panY);
     const scale = (r) => r && ({ x: Math.round(r.x * sx), y: Math.round(r.y * sy), w: Math.round(r.w * sx), h: Math.round(r.h * sy) });
     this.restoring = true;
     let focusWin = null;

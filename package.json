@@ -34,7 +34,9 @@
     "pg": "^8.13.3",
     "sql.js": "^1.12.0",
     "systeminformation": "^5.25.11",
-    "ws": "^8.18.1"
+    "ws": "^8.18.1",
+    "@microsoft/copilot-sdk": "^2.0.3",
+    "@openai/codex-sdk": "^0.172.0"
   },
   "optionalDependencies": {
     "node-pty": "^1.1.0"
@@ -52,7 +54,9 @@
     ],
     "asarUnpack": [
       "node_modules/node-pty/**",
-      "node_modules/sql.js/dist/**"
+      "node_modules/sql.js/dist/**",
+      "node_modules/@openai/codex-*/**",
+      "main/windows/alt-tab-hook.ps1"
     ],
     "linux": {
       "target": [
@@ -74,6 +78,9 @@
     }
   },
   "engines": {
-    "node": ">=20.17"
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "allowScripts": {
+    "electron@37.10.3": true
   }
 }

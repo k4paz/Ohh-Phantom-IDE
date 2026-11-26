@@ -2,6 +2,7 @@
 import { h, esc, bytes, rate, pct, dur } from '../core/dom.js';
 import { onTelemetry, telemetry, poll } from '../core/api.js';
 import { plot, bars, cssVar } from '../core/graph.js';
+import { showProcessMenu } from '../core/proc-menu.js';
 import { wm } from '../core/wm.js';
 
 export default {
@@ -18,7 +19,8 @@ export default {
     const net = panel('NETWORK');
     const fsList = h('div.sm-fs');
     const top = h('table.grid.sm-top');
-    el.append(head, cpu.p, mem.p, h('div.sm-row', disk.p, net.p), h('div.sm-panel', h('div.hdr', 'FILESYSTEMS'), fsList), h('div.sm-panel', h('div.hdr', 'TOP PROCESSES', h('span.sp'), h('button.btn.ghost', { on: { click: () => wm.open('procs') } }, 'process manager →')), top));
+    let processList = [];
+    el.append(head, cpu.p, mem.p, h('div.sm-row', disk.p, net.p), h('div.sm-panel', h('div.hdr', 'FILESYSTEMS'), fsList), h('div.sm-panel', h('div.hdr', 'TOP PROCESSES', h('span.c-dim', 'right-click a process for actions'), h('span.sp'), h('button.btn.ghost', { on: { click: () => wm.open('procs') } }, 'process manager →')), top));
 
     const draw = (s, hist) => {
       if (!win.visible) return;
@@ -42,10 +44,17 @@ export default {
     };
     const off = onTelemetry(draw);
     const procPoll = poll('proc:list', 2500, (r) => {
+      processList = r.procs;
       const list = [...r.procs].sort((a, b) => b.cpu - a.cpu).slice(0, 8);
       top.innerHTML = '<tr><th class="num">PID</th><th>NAME</th><th>USER</th><th class="num">CPU</th><th class="num">MEM</th></tr>' +
-        list.map((p) => `<tr><td class="num c-dim">${p.pid}</td><td>${esc(p.name)}</td><td class="c-dim">${esc(p.user)}</td><td class="num ${p.cpu > 50 ? 'c-red' : p.cpu > 10 ? 'c-amber' : ''}">${p.cpu.toFixed(1)}</td><td class="num">${bytes(p.rss)}</td></tr>`).join('');
+        list.map((p) => `<tr data-pid="${p.pid}"><td class="num c-dim">${p.pid}</td><td>${esc(p.name)}</td><td class="c-dim">${esc(p.user)}</td><td class="num ${p.cpu > 50 ? 'c-red' : p.cpu > 10 ? 'c-amber' : ''}">${p.cpu.toFixed(1)}</td><td class="num">${bytes(p.rss)}</td></tr>`).join('');
     }).when(() => win.visible);
+    top.addEventListener('contextmenu', (e) => {
+      const row = e.target.closest('tr[data-pid]');
+      if (!row) return;
+      const p = processList.find((item) => item.pid === Number(row.dataset.pid));
+      if (p) showProcessMenu(e, p, { refresh: () => procPoll.now() });
+    });
     win.onResize(() => { const hh = telemetry.history; if (hh.length) draw(hh[hh.length - 1], hh); });
     return {
       onShow: () => { const hh = telemetry.history; if (hh.length) draw(hh[hh.length - 1], hh); },

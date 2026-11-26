@@ -59,6 +59,14 @@ module.exports = (core) => {
       const rows = Math.max(1, Math.min(500, opts.rows | 0 || 24));
       const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'PHANTOM' };
       if (opts.env && typeof opts.env === 'object') for (const [k, v] of Object.entries(opts.env)) if (ENV_KEY.test(k)) env[k] = String(v);
+      if (Array.isArray(opts.unsetEnv)) {
+        for (const name of opts.unsetEnv) {
+          if (typeof name !== 'string' || !ENV_KEY.test(name)) continue;
+          for (const key of Object.keys(env)) {
+            if (key.toUpperCase() === name.toUpperCase()) delete env[key];
+          }
+        }
+      }
       delete env.ELECTRON_RUN_AS_NODE;
 
       const id = nextId++;

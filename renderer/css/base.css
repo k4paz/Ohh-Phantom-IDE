@@ -100,12 +100,21 @@ body.grid-on #wallpaper {
     radial-gradient(ellipse at 50% 40%, rgba(var(--accent-rgb), .045), transparent 65%),
     linear-gradient(rgba(var(--accent-rgb), .035) 1px, transparent 1px),
     linear-gradient(90deg, rgba(var(--accent-rgb), .035) 1px, transparent 1px);
-  background-size: 100% 100%, 32px 32px, 32px 32px;
+  background-size: 100% 100%, var(--wallpaper-grid-size, 32px) var(--wallpaper-grid-size, 32px), var(--wallpaper-grid-size, 32px) var(--wallpaper-grid-size, 32px);
+  background-position:
+    calc(50% + var(--wallpaper-pan-x, 0px)) calc(50% + var(--wallpaper-pan-y, 0px)),
+    var(--wallpaper-pan-x, 0px) var(--wallpaper-pan-y, 0px),
+    var(--wallpaper-pan-x, 0px) var(--wallpaper-pan-y, 0px);
 }
+#desktop.wallpaper-panning { cursor: grabbing; user-select: none; }
 #wallpaper .sig { position: absolute; right: 22px; bottom: 16px; text-align: right; color: var(--mute); font-size: var(--fs-xs); line-height: 1.6; letter-spacing: .1em; }
 #wallpaper .sig b { display: block; color: rgba(var(--accent-rgb), .22); font-size: 34px; letter-spacing: .5em; font-weight: 800; margin-bottom: 4px; }
 #wallpaper .hint { position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%); color: var(--mute); text-align: center; line-height: 2; }
 #wallpaper .hint kbd { border: 1px solid var(--line2); padding: 0 5px; color: var(--dim); }
+#wallpaper .wallpaper-controls { position: absolute; left: 16px; bottom: 16px; z-index: 30002; display: flex; align-items: center; gap: 4px; border: 1px solid var(--line2); border-radius: 7px; background: var(--bg1); padding: 4px; box-shadow: 0 4px 14px rgba(0,0,0,.25); pointer-events: auto; }
+#wallpaper .wallpaper-controls[hidden] { display: none; }
+.wallpaper-pan-reset { height: 25px; padding: 0 7px; border: 0; border-radius: 4px; background: transparent; color: var(--dim); cursor: pointer; font-size: 8px; letter-spacing: .08em; }
+.wallpaper-pan-reset:hover { background: var(--bg2); color: var(--accent); }
 
 #fx-scanlines { pointer-events: none; position: fixed; inset: 0; z-index: 99999; display: none; background: repeating-linear-gradient(to bottom, rgba(0,0,0,0) 0, rgba(0,0,0,0) 2px, rgba(0,0,0,.16) 3px); mix-blend-mode: multiply; }
 body.scanlines #fx-scanlines { display: block; }

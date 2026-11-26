@@ -2,7 +2,7 @@
 // Sandboxed preload: exposes a narrow, typed bridge. No Node APIs leak to the page.
 const { contextBridge, ipcRenderer } = require('electron');
 
-const CHANNEL_RE = /^[a-z]+:[a-zA-Z]+$/;
+const CHANNEL_RE = /^[a-z]+:[a-zA-Z]+(?::[a-zA-Z][a-zA-Z-]*)*$/;
 const listeners = new Map(); // channel -> Set<fn>
 
 function ensure(channel) {

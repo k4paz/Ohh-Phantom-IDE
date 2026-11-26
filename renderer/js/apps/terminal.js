@@ -11,7 +11,15 @@ export default {
     const host = h('div.term-host');
     win.body.appendChild(host);
     win.body.classList.add('term-body');
-    const cfg = { cwd: state.cwd || project.root || undefined, shell: state.shell || settings.shell || undefined, args: state.args || undefined, title: state.title, run: !!state.run };
+    const cfg = {
+      cwd: state.cwd || project.root || undefined,
+      shell: state.shell || settings.shell || undefined,
+      args: state.args || undefined,
+      env: state.env && typeof state.env === 'object' ? state.env : undefined,
+      unsetEnv: Array.isArray(state.unsetEnv) ? state.unsetEnv : undefined,
+      title: state.title,
+      run: !!state.run
+    };
     if (cfg.title) win.setTitle(cfg.title);
     let session = null; let exited = false; let cwd = cfg.cwd; const offs = [];
     const isSsh = !!(cfg.shell && /(^|[\\/])ssh(\.exe)?$/.test(cfg.shell));
@@ -75,7 +83,10 @@ export default {
       exited = false; win.setBadge('');
       try {
         if (fit) try { fit.fit(); } catch { /* hidden */ }
-        session = await call('pty:spawn', { cwd, shell: cfg.shell, args: cfg.args, cols: term.cols || 80, rows: term.rows || 24 });
+        session = await call('pty:spawn', {
+          cwd, shell: cfg.shell, args: cfg.args, env: cfg.env, unsetEnv: cfg.unsetEnv,
+          cols: term.cols || 80, rows: term.rows || 24
+        });
         if (!cfg.title) win.setTitle(isSsh ? 'SSH' : 'Terminal');
         win.setSub(isSsh ? (cfg.args || []).slice(-1)[0] : `${basename(session.shell)} · ${session.cwd.replace(project.home || '\0', '~')}`);
         if (session.kind !== 'pty') term.write(`\x1b[33m[phantom] node-pty unavailable — running via ${session.kind} bridge (no live resize)\x1b[0m\r\n`);
@@ -122,7 +133,10 @@ export default {
     return {
       onShow: () => { resize(); },
       onFocus: () => term.focus(),
-      serialize: () => ({ cwd, shell: cfg.shell, args: cfg.args, title: cfg.title, run: cfg.run }),
+      serialize: () => ({
+        cwd, shell: cfg.shell, args: cfg.args, env: cfg.env, unsetEnv: cfg.unsetEnv,
+        title: cfg.title, run: cfg.run
+      }),
       isRun: cfg.run,
       // Type a command into this shell. `build` gets the shell kind (pwsh/powershell/cmd/posix).
       async exec(build) {

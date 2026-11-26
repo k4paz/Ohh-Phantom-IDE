@@ -11,12 +11,16 @@ import * as run from './run.js';
 import * as live from './collab.js';
 
 export const DOCK = [
-  ['editor', 'explorer', 'search', 'terminal', 'git'],
+  ['projects', 'editor', 'explorer', 'search', 'terminal', 'git'],
   ['debug', 'tests', 'build'],
   ['api', 'db', 'json', 'markdown'],
   ['sysmon', 'net', 'procs', 'logs', 'events'],
-  ['collab', 'ssh', 'audit', 'arch', 'agents']
+  ['collab', 'ssh', 'audit', 'arch', 'agents', 'flow']
 ];
+
+function toggleFullscreen() {
+  call('app:fullscreen').catch((error) => fail(error, 'HARD FULLSCREEN'));
+}
 
 // Fractional layouts (desk 1×1) — scaled to the real desktop by restoreLayout.
 export const PRESETS = {
@@ -40,7 +44,15 @@ export const PRESETS = {
   ]
 };
 function presetLayout(name) {
-  return { v: 1, active: wm.active, desk: { w: 1, h: 1 }, windows: PRESETS[name].map(([app, x, y, w, hh]) => ({ app, ws: wm.active, rect: { x, y, w, h: hh }, state: {} })) };
+  const view = wm.viewRect();
+  return {
+    v: 1, active: wm.active, desk: { w: wm.W, h: wm.H }, viewport: { ...wm.viewport },
+    windows: PRESETS[name].map(([app, x, y, w, hh]) => ({
+      app, ws: wm.active,
+      rect: { x: view.x + x * view.w, y: view.y + y * view.h, w: w * view.w, h: hh * view.h },
+      state: {}
+    }))
+  };
 }
 export async function applyPreset(name, { replace = true } = {}) {
   if (replace) {
@@ -99,17 +111,20 @@ export function commands() {
     { group: 'window', label: 'Tile windows', icon: 'layout', key: 'Ctrl+Alt+T', run: () => wm.tile() },
     { group: 'window', label: 'Cascade windows', icon: 'layout', run: () => wm.cascade() },
     { group: 'window', label: 'Show desktop', icon: 'layout', key: 'Ctrl+Alt+D', run: () => wm.showDesktop() },
+    { group: 'window', label: 'Duplicate focused window', icon: 'layout', key: 'Ctrl+Shift+D', run: () => wm.focused && wm.duplicate(wm.focused) },
+    { group: 'window', label: 'Close all other windows', icon: 'close', key: 'Ctrl+Shift+R', run: () => wm.focused && wm.closeOthers(wm.focused) },
+    { group: 'window', label: 'Cycle windows', icon: 'layout', key: 'Ctrl+Tab', run: () => wm.cycle(1) },
     { group: 'window', label: 'Close all windows in this workspace', icon: 'close', run: async () => { for (const w of [...wm.windows]) if (w.ws === wm.active) await wm.close(w); } },
     { group: 'window', label: 'Toggle always-on-top for focused window', icon: 'pin', run: () => wm.focused && wm.setPinned(wm.focused, !wm.focused.pinned) },
-    ...[0, 1, 2, 3].map((i) => ({ group: 'window', label: `Switch to workspace ${i + 1}`, icon: 'layout', key: `Ctrl+Alt+${i + 1}`, run: () => wm.switchWorkspace(i) })),
+    ...[0, 1, 2, 3].map((i) => ({ group: 'window', label: `Switch to workspace ${i + 1}`, icon: 'layout', key: `Ctrl+Shift+${i + 1}`, run: () => wm.switchWorkspace(i) })),
     { group: 'layout', label: 'Save layout as…', icon: 'save', key: 'Ctrl+Shift+L', run: saveLayoutAs },
     ...Object.keys(PRESETS).map((n) => ({ group: 'layout', label: `Preset: ${n}`, icon: 'layout', run: () => applyPreset(n) })),
     { group: 'theme', label: 'Toggle scanlines', icon: 'eye', run: () => setSetting('scanlines', !settings.scanlines) },
     { group: 'theme', label: 'Toggle desktop grid', icon: 'eye', run: () => setSetting('grid', !settings.grid) },
     ...Object.entries(THEMES).map(([k, t]) => ({ group: 'theme', label: `Theme: ${t.name}`, detail: t.desc, icon: 'eye', run: () => setSetting('theme', k) })),
     { group: 'system', label: 'Settings', icon: 'settings', key: 'Ctrl+,', run: () => wm.open('settings') },
-    { group: 'system', label: 'Toggle developer tools', icon: 'debug', run: () => call('app:devtools') },
-    { group: 'system', label: 'Toggle fullscreen', icon: 'max', key: 'F11', run: () => call('app:fullscreen') },
+    { group: 'system', label: 'Toggle developer tools', icon: 'debug', key: 'F12', run: () => call('app:devtools') },
+    { group: 'system', label: 'Toggle fullscreen (Windows hard kiosk)', icon: 'max', key: 'F11', run: toggleFullscreen },
     { group: 'system', label: 'Reload interface', icon: 'refresh', run: () => location.reload() }
   );
   return out;
@@ -157,8 +172,8 @@ function buildTopbar() {
       { label: 'Command palette', key: 'Ctrl+Shift+P', action: commandPalette },
       { label: 'Settings', key: 'Ctrl+,', action: () => wm.open('settings') },
       '-',
-      { label: 'Toggle fullscreen', key: 'F11', action: () => call('app:fullscreen') },
-      { label: 'Developer tools', action: () => call('app:devtools') },
+      { label: 'Toggle fullscreen (Windows hard kiosk)', key: 'F11', action: toggleFullscreen },
+      { label: 'Developer tools', key: 'F12', action: () => call('app:devtools') },
       { label: 'Reload interface', action: () => location.reload() },
       '-',
       { label: 'Quit', danger: true, action: quit }
@@ -191,7 +206,7 @@ function buildTopbar() {
       { label: 'Tile', key: 'Ctrl+Alt+T', action: () => wm.tile() },
       { label: 'Cascade', action: () => wm.cascade() },
       { label: 'Show desktop', key: 'Ctrl+Alt+D', action: () => wm.showDesktop() },
-      { label: 'Cycle windows', key: 'Alt+`', action: () => wm.cycle(1) },
+      { label: 'Cycle windows', key: 'Ctrl+Tab', action: () => wm.cycle(1) },
       '-',
       { label: 'Snapping to edges', check: settings.snap, action: () => setSetting('snap', !settings.snap) },
       { label: 'Magnetic alignment', check: settings.magnet > 0, action: () => setSetting('magnet', settings.magnet > 0 ? 0 : 10) },
@@ -231,7 +246,7 @@ function buildTopbar() {
   const projEl = h('span.proj', { on: { click: pickProject } });
   const branchEl = h('span.branch');
   const ws = h('div.ws');
-  for (let i = 0; i < wm.workspaceCount(); i++) ws.appendChild(h('button', { title: `Workspace ${i + 1}  (Ctrl+Alt+${i + 1})`, on: { click: () => wm.switchWorkspace(i) } }, String(i + 1)));
+  for (let i = 0; i < wm.workspaceCount(); i++) ws.appendChild(h('button', { title: `Workspace ${i + 1}  (Ctrl+Shift+${i + 1})`, on: { click: () => wm.switchWorkspace(i) } }, String(i + 1)));
   const meter = (label) => { const c = h('canvas'); const v = h('b', '—'); return { el: h('div.meter', label, c, v), c, v }; };
   const mCpu = meter('CPU'); const mMem = meter('MEM'); const mNet = meter('NET');
   const meters = h('div.meters', { on: { click: () => wm.open('sysmon') }, style: { cursor: 'pointer' } }, mCpu.el, mMem.el, mNet.el);
@@ -315,8 +330,9 @@ function buildTaskbar() {
   const render = () => {
     const list = wm.windows.filter((w) => w.ws === wm.active).sort((a, b) => a.id - b.id);
     tasks.innerHTML = '';
-    for (const w of list) {
-      const b = h('button.task' + (w === wm.focused ? '.focus' : '') + (w.min ? '.min' : ''), { 'data-win': w.id, title: `${w.title}${w.sub ? ' — ' + w.sub : ''}`, html: `${icon(w.app.icon)}<span>${esc(w.title)}${w.sub ? ' <span class="c-dim">' + esc(basename(w.sub)) + '</span>' : ''}</span>${w.pinned ? '<span class="pin">▲</span>' : ''}` });
+    for (const [index, w] of list.entries()) {
+      const shortcut = index < 9 ? ` · Ctrl+${index + 1}` : '';
+      const b = h('button.task' + (w === wm.focused ? '.focus' : '') + (w.min ? '.min' : ''), { 'data-win': w.id, title: `${w.title}${w.sub ? ' — ' + w.sub : ''}${shortcut}`, html: `${icon(w.app.icon)}<span>${esc(w.title)}${w.sub ? ' <span class="c-dim">' + esc(basename(w.sub)) + '</span>' : ''}</span>${w.pinned ? '<span class="pin">▲</span>' : ''}` });
       b.addEventListener('click', () => { if (w === wm.focused && !w.min) wm.minimize(w); else { wm.restore(w); wm.focus(w); } });
       b.addEventListener('auxclick', (e) => { if (e.button === 1) wm.close(w); });
       b.addEventListener('contextmenu', (e) => { e.preventDefault(); wm.windowMenu(w, e.clientX, e.clientY - 300); });
@@ -345,23 +361,116 @@ function buildTaskbar() {
 function buildWallpaper() {
   const wp = document.getElementById('wallpaper');
   const sig = h('div.sig');
-  const hint = h('div.hint', { html: '<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> command palette &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>`</kbd> terminal &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>O</kbd> open project &nbsp;·&nbsp; <kbd>F5</kbd> run<br>drag windows to screen edges to snap · <kbd>Alt</kbd> while dragging disables magnets' });
-  wp.append(sig, hint);
+  const hint = h('div.hint');
+  const commandHints = '<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> command palette &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>`</kbd> terminal &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>O</kbd> open project &nbsp;·&nbsp; <kbd>F5</kbd> run<br>drag windows to screen edges to snap · <kbd>Alt</kbd> while dragging disables magnets';
+  const panReset = h('button.wallpaper-pan-reset', { type: 'button', title: 'Reset desktop viewport position', 'aria-label': 'Reset desktop viewport position' }, 'RESET VIEW');
+  const controls = h('div.wallpaper-controls', { role: 'group', 'aria-label': 'Desktop viewport controls' }, panReset);
+  wp.append(sig, hint, controls);
+
+  const desktop = document.getElementById('desktop');
+  let panDrag = null;
+  let suppressContextMenu = false;
+  const drawWallpaper = () => {
+    const { panX, panY } = wm.viewport;
+    wp.style.setProperty('--wallpaper-grid-size', '32px');
+    wp.style.setProperty('--wallpaper-pan-x', `${panX}px`);
+    wp.style.setProperty('--wallpaper-pan-y', `${panY}px`);
+  };
+  bus.on('wm:viewport', drawWallpaper);
+  panReset.addEventListener('click', () => {
+    wm.setViewportTransform(1, 0, 0);
+    wm.changed('viewport');
+  });
+  controls.addEventListener('contextmenu', (event) => { event.preventDefault(); event.stopPropagation(); });
+  desktop.addEventListener('pointerdown', (event) => {
+    if (event.target !== desktop && event.target !== wp) return;
+    if (event.button !== 1 && event.button !== 2) return;
+    event.preventDefault();
+    panDrag = {
+      pointerId: event.pointerId,
+      button: event.button,
+      startX: event.clientX,
+      startY: event.clientY,
+      panX: wm.viewport.panX,
+      panY: wm.viewport.panY,
+      moved: false
+    };
+    desktop.classList.add('wallpaper-panning');
+    desktop.setPointerCapture(event.pointerId);
+  }, true);
+  window.addEventListener('pointermove', (event) => {
+    if (!panDrag || panDrag.pointerId !== event.pointerId) return;
+    const dx = event.clientX - panDrag.startX;
+    const dy = event.clientY - panDrag.startY;
+    panDrag.moved ||= Math.abs(dx) > 3 || Math.abs(dy) > 3;
+    if (!panDrag.moved) return;
+    wm.setViewportTransform(wm.viewport.zoom, panDrag.panX + dx, panDrag.panY + dy);
+  });
+  const finishPan = (event) => {
+    if (!panDrag || panDrag.pointerId !== event.pointerId) return;
+    suppressContextMenu = panDrag.button === 2 && panDrag.moved;
+    const moved = panDrag.moved;
+    panDrag = null;
+    desktop.classList.remove('wallpaper-panning');
+    if (moved) wm.changed('viewport');
+    if (suppressContextMenu) setTimeout(() => { suppressContextMenu = false; }, 350);
+  };
+  window.addEventListener('pointerup', finishPan);
+  window.addEventListener('pointercancel', finishPan);
+  desktop.addEventListener('contextmenu', (event) => {
+    if (!suppressContextMenu && !(panDrag?.button === 2 && panDrag.moved)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    suppressContextMenu = false;
+  }, true);
   const upd = () => {
     const s = telemetry.static;
     sig.innerHTML = `<b>PHANTOM</b>${s ? `${esc(s.user)}@${esc(s.hostname)} · ${esc(s.distro)} · ${esc(s.cpuModel)} × ${s.cores}` : ''}`;
-    hint.style.display = wm.windows.some((w) => w.visible) ? 'none' : '';
+    const hasWindows = wm.windows.some((w) => w.visible);
+    hint.innerHTML = `${commandHints}<br>middle/right-drag desktop to move the viewport`;
+    hint.style.display = hasWindows ? 'none' : '';
+    controls.hidden = false;
   };
-  bus.on('wm:changed', upd); setTimeout(upd, 1500); upd();
+  bus.on('wm:changed', upd);
+  bus.on('settings:changed', (key) => { if (key === 'grid') upd(); });
+  setTimeout(upd, 1500);
+  drawWallpaper();
+  upd();
 }
 
 // ───────── keyboard ─────────
 function keybindings() {
+  on('app:cycleWindows', (direction) => wm.cycle(direction === -1 ? -1 : 1));
+  on('app:kioskError', (message) => fail(message, 'HARD FULLSCREEN'));
+  document.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || (e.key !== 'Tab' && e.code !== 'Tab')) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    wm.cycle(e.shiftKey ? -1 : 1);
+  }, true);
   document.addEventListener('keydown', (e) => {
     const ctrl = e.ctrlKey || e.metaKey; const k = e.key;
     const f = wm.focused;
     const stop = () => { e.preventDefault(); e.stopPropagation(); };
-    if (ctrl && e.shiftKey && (k === 'P' || k === 'p')) { stop(); commandPalette(); }
+    if (ctrl && e.shiftKey && !e.altKey && /^[1-4]$/.test(k)) { stop(); wm.switchWorkspace(Number(k) - 1); }
+    else if (ctrl && !e.altKey && !e.shiftKey && /^[1-9]$/.test(k)) {
+      stop();
+      const task = document.querySelector(`#taskbar .tasks .task:nth-child(${Number(k)})`);
+      const win = task && wm.windows.find((item) => item.id === Number(task.dataset.win));
+      if (win) {
+        if (win.min) wm.restore(win);
+        wm.focus(win);
+      }
+    }
+    else if (ctrl && e.shiftKey && !e.altKey && (k === 'D' || k === 'd')) {
+      stop();
+      if (f) wm.duplicate(f).catch((error) => fail(error, 'DUPLICATE WINDOW'));
+    }
+    else if (ctrl && e.shiftKey && !e.altKey && (k === 'R' || k === 'r')) {
+      stop();
+      wm.closeOthers(f).catch((error) => fail(error, 'CLOSE OTHER WINDOWS'));
+    }
+    else if (ctrl && e.shiftKey && (k === 'P' || k === 'p')) { stop(); commandPalette(); }
     else if (ctrl && !e.shiftKey && !e.altKey && (k === 'k' || k === 'K') && !(f && f.app.id === 'terminal')) { stop(); commandPalette(); }
     else if (ctrl && !e.shiftKey && !e.altKey && (k === 'p' || k === 'P')) { stop(); quickOpen(); }
     else if (ctrl && !e.shiftKey && (k === 'o' || k === 'O')) { stop(); pickProject(); }
@@ -370,6 +479,7 @@ function keybindings() {
     else if (ctrl && e.shiftKey && (k === 'E' || k === 'e')) { stop(); wm.open('explorer'); }
     else if (ctrl && e.shiftKey && (k === 'G' || k === 'g')) { stop(); wm.open('git'); }
     else if (ctrl && e.shiftKey && (k === 'L' || k === 'l')) { stop(); saveLayoutAs(); }
+    else if (ctrl && !e.shiftKey && !e.altKey && (k === 'W' || k === 'w')) { stop(); if (f) wm.close(f); }
     else if (ctrl && e.shiftKey && (k === 'W' || k === 'w')) { stop(); if (f) wm.close(f); }
     else if (ctrl && k === ',') { stop(); wm.open('settings'); }
     else if (e.altKey && (k === '`' || e.code === 'Backquote')) { stop(); wm.cycle(e.shiftKey ? -1 : 1); }
@@ -380,11 +490,12 @@ function keybindings() {
       else if (!document.body.dataset.debugActive) { stop(); run.start({ debug: true }); }
       // with a live debug session, plain F5 falls through to the debugger (continue / pause)
     }
-    else if (k === 'F11' && !document.body.dataset.debugPaused) { stop(); call('app:fullscreen'); }
+    else if (k === 'F11' && !document.body.dataset.debugPaused) { stop(); toggleFullscreen(); }
+    else if (k === 'F12') { stop(); call('app:devtools'); }
     else if (ctrl && e.altKey && /^Digit[1-4]$/.test(e.code)) { stop(); const i = Number(e.code.slice(5)) - 1; if (e.shiftKey && f) wm.moveToWorkspace(f, i); else wm.switchWorkspace(i); }
     else if (ctrl && e.altKey && (k === 't' || k === 'T')) { stop(); wm.tile(); }
     else if (ctrl && e.altKey && (k === 'd' || k === 'D')) { stop(); wm.showDesktop(); }
-    else if (ctrl && e.altKey && f && k.startsWith('Arrow')) {
+    else if (ctrl && e.altKey && e.shiftKey && f && k.startsWith('Arrow')) {
       stop();
       const z = f.snapZone; const m = f.max;
       if (k === 'ArrowLeft') wm.snap(f, z === 'right' ? 'center' : z === 'tl' || z === 'bl' ? z : 'left');

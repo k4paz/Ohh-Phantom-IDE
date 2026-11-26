@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const { pathToFileURL } = require('url');
 const { createCore } = require('./registry');
+const { createAltTabHook } = require('./windows/alt-tab');
 
 const ROOT = path.join(__dirname, '..');
 const RENDERER = path.join(ROOT, 'renderer');
@@ -32,6 +33,47 @@ if (!app.requestSingleInstanceLock()) app.quit();
 
 let mainWindow = null;
 let core = null;
+const altTabHook = createAltTabHook({
+  onCycle: (direction) => core && core.emit('app:cycleWindows', direction),
+  onExit: () => leaveHardFullscreen(),
+  onFailure: (error) => {
+    if (core) {
+      core.log('error', `Hard fullscreen keyboard hook failed: ${error.message}`, 'WINDOW');
+      core.emit('app:kioskError', error.message);
+    }
+    leaveHardFullscreen();
+  }
+});
+
+function leaveHardFullscreen() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setKiosk(false);
+    mainWindow.setFullScreen(false);
+  }
+  altTabHook.stop();
+}
+
+async function toggleFullscreen() {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  if (process.platform !== 'win32') {
+    mainWindow.setFullScreen(!mainWindow.isFullScreen());
+    return true;
+  }
+  if (mainWindow.isKiosk()) {
+    leaveHardFullscreen();
+    return false;
+  }
+  await altTabHook.start();
+  if (!altTabHook.isRunning()) throw new Error('The Windows keyboard hook stopped before hard fullscreen could start.');
+  try {
+    mainWindow.setKiosk(true);
+    mainWindow.setFullScreen(true);
+  } catch (error) {
+    leaveHardFullscreen();
+    throw error;
+  }
+  return true;
+}
 
 function resolveAsset(urlPath) {
   const clean = decodeURIComponent(urlPath.split('?')[0].split('#')[0]);
@@ -80,6 +122,10 @@ function createWindow() {
   mainWindow.webContents.on('will-navigate', (e, url) => { if (!url.startsWith(ORIGIN)) e.preventDefault(); });
   mainWindow.on('maximize', () => core && core.emit('app:windowState', { maximized: true }));
   mainWindow.on('unmaximize', () => core && core.emit('app:windowState', { maximized: false }));
+  mainWindow.on('closed', () => {
+    altTabHook.stop();
+    mainWindow = null;
+  });
   mainWindow.loadURL(ORIGIN + '/index.html');
 }
 
@@ -134,7 +180,7 @@ app.whenReady().then(() => {
         toggleMaximize: () => (mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize()),
         close: () => mainWindow.close(),
         devtools: () => mainWindow.webContents.toggleDevTools(),
-        fullscreen: () => mainWindow.setFullScreen(!mainWindow.isFullScreen()),
+        fullscreen: () => toggleFullscreen(),
         isMaximized: () => mainWindow.isMaximized()
       },
       versions: { electron: process.versions.electron, chrome: process.versions.chrome, node: process.versions.node }
@@ -163,6 +209,7 @@ app.on('before-quit', async (e) => {
   if (quitting || !core) return;
   e.preventDefault();
   quitting = true;
+  altTabHook.stop();
   await core.shutdown();
   app.quit();
 });
