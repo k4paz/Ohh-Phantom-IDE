@@ -68,6 +68,8 @@ export class WindowManager {
     this.history = []; // focus order (most recent last)
     this.cycleOrder = null;
     this.cycling = false;
+    this.windowSwitcher = null;
+    this.windowSwitcherTimer = null;
   }
 
   init(desktop) {
@@ -76,6 +78,7 @@ export class WindowManager {
     this.guides = desktop.querySelector('#guides');
     this.world = h('div#window-viewport');
     this.desk.insertBefore(this.world, this.preview);
+    this.buildWindowSwitcher();
     this.viewport = { zoom: 1, panX: 0, panY: 0 };
     new ResizeObserver(() => this.onDesktopResize()).observe(desktop);
     this.lastDesk = { w: desktop.clientWidth, h: desktop.clientHeight };
@@ -250,7 +253,7 @@ export class WindowManager {
   ofApp(appId) { return this.windows.filter((w) => w.app.id === appId); }
 
   // ───────── state changes ─────────
-  minimize(win, instant = false) {
+  minimize(win, instant = false, keepFocus = false) {
     if (win.min) return;
     const btn = document.querySelector(`#taskbar .task[data-win="${win.id}"]`);
     if (!instant && btn && !settings.reduceMotion) {
@@ -261,7 +264,7 @@ export class WindowManager {
       setTimeout(() => { win.el.classList.remove('minimizing'); win.el.style.transform = ''; win.min = true; this.sync(win); }, 180);
     } else { win.min = true; this.sync(win); }
     win.min = true;
-    if (this.focused === win) { win.el.classList.remove('focus'); this.focused = null; this.history = this.history.filter((w) => w !== win); this.history.unshift(win); this.focusTop(); }
+    if (this.focused === win && !keepFocus) { win.el.classList.remove('focus'); this.focused = null; this.history = this.history.filter((w) => w !== win); this.history.unshift(win); this.focusTop(); }
     this.changed('min');
   }
   restore(win) {
@@ -358,6 +361,139 @@ export class WindowManager {
     if (vis.length) { this._shown = vis; vis.forEach((w) => this.minimize(w, true)); }
     else if (this._shown) { this._shown.forEach((w) => this.restore(w)); this._shown = null; this.focusTop(); }
   }
+  buildWindowSwitcher() {
+    this.windowSwitcherEl = h('div#alt-tab-switcher.window-switcher', {
+      role: 'dialog',
+      'aria-label': 'Open windows',
+      'aria-hidden': 'true'
+    },
+    this.windowSwitcherPanel = h('div.window-switcher-panel',
+      h('div.window-switcher-heading', h('span', 'OPEN WINDOWS'), h('span.window-switcher-hint', 'ALT + TAB')),
+      this.windowSwitcherGrid = h('div.window-switcher-grid'),
+      h('div.window-switcher-footer', 'Release ALT to switch · ESC to cancel')
+    ));
+    document.body.appendChild(this.windowSwitcherEl);
+  }
+  windowSwitcherOrder() {
+    const open = this.windows.filter((win) => !win.closed);
+    return [
+      ...this.history.filter((win) => open.includes(win)),
+      ...open.filter((win) => !this.history.includes(win)).sort((a, b) => a.id - b.id)
+    ];
+  }
+  stepWindowSwitcher(direction = 1) {
+    if (!this.windowSwitcher) {
+      const windows = this.windowSwitcherOrder();
+      if (!windows.length) return;
+      const focusedIndex = windows.indexOf(this.focused);
+      this.windowSwitcher = {
+        windows,
+        selectedIndex: ((focusedIndex < 0 ? 0 : focusedIndex) - direction + windows.length) % windows.length
+      };
+      this.windowSwitcherEl.classList.add('on');
+      this.windowSwitcherEl.setAttribute('aria-hidden', 'false');
+      this.windowSwitcherTimer = setInterval(() => this.refreshWindowSwitcher(), 500);
+      this.renderWindowSwitcher();
+      return;
+    }
+    const current = this.windowSwitcher.windows[this.windowSwitcher.selectedIndex];
+    const windows = this.windowSwitcherOrder();
+    if (!windows.length) return this.cancelWindowSwitcher();
+    this.windowSwitcher.windows = windows;
+    const index = windows.indexOf(current);
+    this.windowSwitcher.selectedIndex = ((index < 0 ? 0 : index) - direction + windows.length) % windows.length;
+    this.renderWindowSwitcher();
+  }
+  renderWindowSwitcher() {
+    const state = this.windowSwitcher;
+    if (!state) return;
+    this.windowSwitcherGrid.replaceChildren();
+    state.windows.forEach((win, index) => {
+      const rect = win.max ? this.viewRect() : win.rect;
+      const thumbWidth = 300;
+      const thumbHeight = 170;
+      const scale = Math.min((thumbWidth - 12) / rect.w, (thumbHeight - 12) / rect.h, 0.6);
+      const preview = h('div.window-switcher-preview');
+      const clone = win.el.cloneNode(true);
+      clone.classList.remove('opening', 'closing', 'minimizing', 'dragging', 'resizing');
+      clone.classList.add('window-switcher-window');
+      clone.style.cssText = `position:absolute;display:flex;left:${(thumbWidth - rect.w * scale) / 2}px;top:${(thumbHeight - rect.h * scale) / 2}px;width:${rect.w}px;height:${rect.h}px;transform:scale(${scale});transform-origin:top left;z-index:auto;`;
+      clone.removeAttribute('id');
+      clone.querySelectorAll('.pw-ctrl, .pw-rz, .pw-size').forEach((el) => el.remove());
+      clone.querySelectorAll('[id]').forEach((el) => el.removeAttribute('id'));
+      clone.querySelectorAll('input, textarea, select').forEach((el, inputIndex) => {
+        const source = win.el.querySelectorAll('input, textarea, select')[inputIndex];
+        if (!source) return;
+        if ('value' in el) el.value = source.value;
+        if ('checked' in el) el.checked = source.checked;
+      });
+      const sourceCanvases = win.el.querySelectorAll('canvas');
+      clone.querySelectorAll('canvas').forEach((canvas, canvasIndex) => {
+        const source = sourceCanvases[canvasIndex];
+        if (!source) return;
+        try { canvas.getContext('2d').drawImage(source, 0, 0); } catch (error) { console.error(error); }
+      });
+      preview.appendChild(clone);
+      const card = h('button.window-switcher-card', {
+        type: 'button',
+        'aria-label': `${win.title} — ${win.app.title}`,
+        'aria-pressed': index === state.selectedIndex ? 'true' : 'false',
+        on: {
+          click: () => {
+            this.selectWindowSwitcherItem(index);
+            this.commitWindowSwitcher();
+          }
+        }
+      },
+      preview,
+      h('span.window-switcher-label', h('span.window-switcher-icon', { html: icon(win.app.icon) }), h('span.window-switcher-title', win.title)),
+      h('span.window-switcher-app', win.app.title));
+      card.classList.toggle('selected', index === state.selectedIndex);
+      this.windowSwitcherGrid.appendChild(card);
+    });
+  }
+  selectWindowSwitcherItem(index) {
+    if (!this.windowSwitcher || index < 0 || index >= this.windowSwitcher.windows.length) return;
+    this.windowSwitcher.selectedIndex = index;
+    this.windowSwitcherGrid.querySelectorAll('.window-switcher-card').forEach((card, cardIndex) => {
+      const selected = cardIndex === index;
+      card.classList.toggle('selected', selected);
+      card.setAttribute('aria-pressed', String(selected));
+    });
+  }
+  refreshWindowSwitcher() {
+    if (!this.windowSwitcher) return;
+    const state = this.windowSwitcher;
+    const selected = state.windows[state.selectedIndex];
+    const windows = this.windowSwitcherOrder();
+    if (!windows.length) return this.cancelWindowSwitcher();
+    const selectedIndex = windows.indexOf(selected);
+    state.windows = windows;
+    state.selectedIndex = selectedIndex < 0
+      ? Math.min(state.selectedIndex, windows.length - 1)
+      : selectedIndex;
+    this.renderWindowSwitcher();
+  }
+  closeWindowSwitcher() {
+    if (this.windowSwitcherTimer) clearInterval(this.windowSwitcherTimer);
+    this.windowSwitcherTimer = null;
+    this.windowSwitcher = null;
+    this.windowSwitcherGrid.replaceChildren();
+    this.windowSwitcherEl.classList.remove('on');
+    this.windowSwitcherEl.setAttribute('aria-hidden', 'true');
+  }
+  commitWindowSwitcher() {
+    if (!this.windowSwitcher) return;
+    const selected = this.windowSwitcher.windows[this.windowSwitcher.selectedIndex];
+    this.closeWindowSwitcher();
+    if (!selected || selected.closed) return;
+    if (selected.ws !== this.active) this.switchWorkspace(selected.ws);
+    this.restore(selected);
+    this.focus(selected);
+  }
+  cancelWindowSwitcher() {
+    if (this.windowSwitcher) this.closeWindowSwitcher();
+  }
   cycle(dir = 1) {
     const vis = this.windows.filter((w) => w.ws === this.active && !w.closed).sort((a, b) => a.id - b.id);
     if (!vis.length) return;
@@ -390,9 +526,11 @@ export class WindowManager {
     // a, b: the two edges of the moving rect on this axis. Returns {delta, at} or null.
     let best = null;
     for (const c of cands) {
-      for (const e of [a, b]) {
+      for (const [edgeIndex, e] of [a, b].entries()) {
         const d = c - e;
-        if (Math.abs(d) <= t && (!best || Math.abs(d) < Math.abs(best.delta))) best = { delta: d, at: c };
+        if (Math.abs(d) <= t && (!best || Math.abs(d) < Math.abs(best.delta))) {
+          best = { delta: d, at: c, offset: edgeIndex === 0 ? 0 : b - a };
+        }
       }
     }
     return best;
@@ -434,6 +572,7 @@ export class WindowManager {
     let r0 = { ...(win.max ? this.viewRect() : win.rect) };
     const startWorld = this.toWorld(sx, sy, deskR);
     let moved = false; let zone = null;
+    let lockedGuideX = null; let lockedGuideY = null;
     const target = e.currentTarget; target.setPointerCapture(e.pointerId);
     const move = (ev) => {
       const dx = (ev.clientX - sx) / this.viewport.zoom; const dy = (ev.clientY - sy) / this.viewport.zoom;
@@ -453,11 +592,22 @@ export class WindowManager {
       }
       let x = r0.x + dx; let y = r0.y + dy;
       let gx = null; let gy = null;
+      const hardLock = ev.ctrlKey && !ev.altKey;
+      if (!hardLock) {
+        lockedGuideX = null;
+        lockedGuideY = null;
+      }
       if (settings.magnet > 0 && !ev.altKey) {
         const { xs, ys } = this.magnetEdges(win);
         const threshold = settings.magnet / this.viewport.zoom;
-        const mx = this.snapAxis(x, x + r0.w, xs, threshold); if (mx) { x += mx.delta; gx = mx.at; }
-        const my = this.snapAxis(y, y + r0.h, ys, threshold); if (my) { y += my.delta; gy = my.at; }
+        const mx = this.snapAxis(x, x + r0.w, xs, threshold);
+        const my = this.snapAxis(y, y + r0.h, ys, threshold);
+        if (hardLock && !lockedGuideX && mx) lockedGuideX = { at: mx.at, offset: mx.offset };
+        if (hardLock && !lockedGuideY && my) lockedGuideY = { at: my.at, offset: my.offset };
+        if (hardLock && lockedGuideX) { x = lockedGuideX.at - lockedGuideX.offset; gx = lockedGuideX.at; }
+        else if (mx) { x += mx.delta; gx = mx.at; }
+        if (hardLock && lockedGuideY) { y = lockedGuideY.at - lockedGuideY.offset; gy = lockedGuideY.at; }
+        else if (my) { y += my.delta; gy = my.at; }
       }
       const view = this.viewRect();
       y = Math.max(view.y, Math.min(y, view.y + view.h - TITLE_H / this.viewport.zoom));
@@ -537,11 +687,11 @@ export class WindowManager {
     menu(x, y, [
       { header: win.title },
       { label: 'Always on top', check: win.pinned, action: () => this.setPinned(win, !win.pinned) },
-      { label: win.max ? 'Restore' : 'Maximize', action: () => this.toggleMax(win), key: '⌃⌥⇧↑' },
-      { label: 'Minimize', action: () => this.minimize(win), key: '⌃⌥⇧↓' },
+      { label: win.max ? 'Restore' : 'Maximize', action: () => this.toggleMax(win), key: 'Win+↑' },
+      { label: 'Minimize', action: () => this.minimize(win), key: 'Win+↓' },
       '-',
-      { label: 'Snap left half', action: () => this.snap(win, 'left'), key: '⌃⌥⇧←' },
-      { label: 'Snap right half', action: () => this.snap(win, 'right'), key: '⌃⌥⇧→' },
+      { label: 'Snap left half', action: () => this.snap(win, 'left'), key: 'Win+←' },
+      { label: 'Snap right half', action: () => this.snap(win, 'right'), key: 'Win+→' },
       { label: 'Snap top / bottom', action: () => this.snap(win, win.snapZone === 'top' ? 'bottom' : 'top') },
       { label: 'Snap quarter', action: () => this.snap(win, ['tl', 'tr', 'br', 'bl'][(['tl', 'tr', 'br', 'bl'].indexOf(win.snapZone) + 1) % 4]) },
       { label: 'Snap thirds', action: () => this.snap(win, ['l3', 'c3', 'r3'][(['l3', 'c3', 'r3'].indexOf(win.snapZone) + 1) % 3]) },

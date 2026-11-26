@@ -6,6 +6,9 @@ const os = require('os');
 const { randomUUID } = require('crypto');
 const { spawn, execFile } = require('child_process');
 const { which, readJson, writeJsonAtomic } = require('../util');
+const { getAgentCapacity } = require('./flow-capacity');
+
+const COPILOT_SEND_TIMEOUT_MS = 30 * 60 * 1000;
 
 const API_CREDENTIALS = new Set([
   'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
@@ -231,6 +234,7 @@ function fetchCopilotQuota() {
 module.exports = (core) => {
   const conversations = new Map();
   const pendingApprovals = new Map();
+  let creatingConversations = 0;
   const accountStateFile = path.join(core.dataDir, 'agent-accounts.json');
   let accountWrites = Promise.resolve();
 
@@ -579,6 +583,10 @@ module.exports = (core) => {
 
   return {
     'agent:copilot:quota': fetchCopilotQuota,
+    'agent:capacity': async () => ({
+      ...getAgentCapacity(),
+      activeAgents: conversations.size + creatingConversations
+    }),
     'agent:accounts:list': async () => accountSnapshot(await readAccountState()),
     'agent:accounts:add': async (provider, nameValue) => {
       requireProvider(provider);
@@ -649,27 +657,34 @@ module.exports = (core) => {
     },
     'agent:create': async (provider, cwdValue, optionsValue) => {
       requireProvider(provider);
-      if (conversations.size >= 4) throw new Error('Close an existing agent chat before opening another.');
-      const cwd = workingDirectory(cwdValue);
-      const options = agentOptions(provider, optionsValue);
-      const accountState = await readAccountState();
-      const requestedAccountId = typeof optionsValue?.accountId === 'string' && optionsValue.accountId
-        ? optionsValue.accountId
-        : accountState.active[provider];
-      await requireAccount(accountState, provider, requestedAccountId);
-      options.accountId = requestedAccountId;
-      const accountEnv = accountEnvironment(provider, requestedAccountId);
-      const id = randomUUID();
-      const conversation = provider === 'copilot'
-        ? await createCopilotConversation(id, cwd, options, accountEnv)
-        : provider === 'codex'
-          ? await createCodexConversation(id, cwd, options, accountEnv)
-          : {
-            id, provider: 'claude', cwd, options, busy: false, proc: null, cancelled: false,
-            accountId: options.accountId, accountEnv, currentUsage: null
-          };
-      conversations.set(id, conversation);
-      return { id, cwd, provider };
+      if (conversations.size + creatingConversations >= getAgentCapacity().maxConcurrentAgents) {
+        throw new Error('The computer has reached its current agent concurrency capacity. Wait for an agent to finish before starting another.');
+      }
+      creatingConversations++;
+      try {
+        const cwd = workingDirectory(cwdValue);
+        const options = agentOptions(provider, optionsValue);
+        const accountState = await readAccountState();
+        const requestedAccountId = typeof optionsValue?.accountId === 'string' && optionsValue.accountId
+          ? optionsValue.accountId
+          : accountState.active[provider];
+        await requireAccount(accountState, provider, requestedAccountId);
+        options.accountId = requestedAccountId;
+        const accountEnv = accountEnvironment(provider, requestedAccountId);
+        const id = randomUUID();
+        const conversation = provider === 'copilot'
+          ? await createCopilotConversation(id, cwd, options, accountEnv)
+          : provider === 'codex'
+            ? await createCodexConversation(id, cwd, options, accountEnv)
+            : {
+              id, provider: 'claude', cwd, options, busy: false, proc: null, cancelled: false,
+              accountId: options.accountId, accountEnv, currentUsage: null
+            };
+        conversations.set(id, conversation);
+        return { id, cwd, provider };
+      } finally {
+        creatingConversations--;
+      }
     },
     'agent:send': async (id, prompt) => {
       const conversation = conversations.get(id);
@@ -688,7 +703,7 @@ module.exports = (core) => {
       emit(id, { type: 'started' });
       try {
         if (conversation.provider === 'copilot') {
-          await conversation.session.sendAndWait({ prompt: prompt.trim() });
+          await conversation.session.sendAndWait({ prompt: prompt.trim() }, COPILOT_SEND_TIMEOUT_MS);
         } else if (conversation.provider === 'codex') {
           await runCodex(conversation, prompt.trim());
         } else {

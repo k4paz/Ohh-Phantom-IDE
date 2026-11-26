@@ -14,9 +14,19 @@ public static class PhantomAltTabHook
     private const int WM_SYSKEYDOWN = 0x0104;
     private const int WM_SYSKEYUP = 0x0105;
     private const int VK_TAB = 0x09;
+    private const int VK_MENU = 0x12;
+    private const int VK_LMENU = 0xA4;
+    private const int VK_RMENU = 0xA5;
     private const int VK_CONTROL = 0x11;
     private const int VK_SHIFT = 0x10;
+    private const int VK_ESCAPE = 0x1B;
     private const int VK_F12 = 0x7B;
+    private const int VK_LEFT = 0x25;
+    private const int VK_UP = 0x26;
+    private const int VK_RIGHT = 0x27;
+    private const int VK_DOWN = 0x28;
+    private const int VK_LWIN = 0x5B;
+    private const int VK_RWIN = 0x5C;
     private const uint WM_QUIT = 0x0012;
     private const uint PM_NOREMOVE = 0x0000;
     private const uint SYNCHRONIZE = 0x00100000;
@@ -26,6 +36,11 @@ public static class PhantomAltTabHook
     private static IntPtr hook;
     private static bool suppressTabUp;
     private static bool suppressF12Up;
+    private static bool suppressEscapeUp;
+    private static bool switcherActive;
+    private static int suppressWindowsArrowUp;
+    private static bool leftWindowsKeyDown;
+    private static bool rightWindowsKeyDown;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct KeyboardData
@@ -89,6 +104,11 @@ public static class PhantomAltTabHook
         return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
     }
 
+    private static bool IsAltKey(int virtualKey)
+    {
+        return virtualKey == VK_MENU || virtualKey == VK_LMENU || virtualKey == VK_RMENU;
+    }
+
     private static void Emit(string message)
     {
         try
@@ -112,9 +132,19 @@ public static class PhantomAltTabHook
             KeyboardData data = (KeyboardData)Marshal.PtrToStructure(lParam, typeof(KeyboardData));
             int key = unchecked((int)data.virtualKey);
 
+            if (down && key == VK_LWIN) leftWindowsKeyDown = true;
+            else if (up && key == VK_LWIN) leftWindowsKeyDown = false;
+            else if (down && key == VK_RWIN) rightWindowsKeyDown = true;
+            else if (up && key == VK_RWIN) rightWindowsKeyDown = false;
+
             if (down && key == VK_F12 && IsDown(VK_CONTROL) && IsDown(VK_SHIFT))
             {
                 suppressF12Up = true;
+                if (switcherActive)
+                {
+                    switcherActive = false;
+                    Emit("SWITCHER_CANCEL");
+                }
                 Emit("EXIT");
                 return new IntPtr(1);
             }
@@ -123,16 +153,46 @@ public static class PhantomAltTabHook
                 suppressF12Up = false;
                 return new IntPtr(1);
             }
+            if (switcherActive && down && key == VK_ESCAPE)
+            {
+                switcherActive = false;
+                suppressEscapeUp = true;
+                Emit("SWITCHER_CANCEL");
+                return new IntPtr(1);
+            }
+            if (up && key == VK_ESCAPE && suppressEscapeUp)
+            {
+                suppressEscapeUp = false;
+                return new IntPtr(1);
+            }
+            if (down && (key == VK_LEFT || key == VK_UP || key == VK_RIGHT || key == VK_DOWN)
+                && (leftWindowsKeyDown || rightWindowsKeyDown))
+            {
+                suppressWindowsArrowUp = key;
+                Emit(key == VK_LEFT ? "SNAP_LEFT" : key == VK_RIGHT ? "SNAP_RIGHT" : key == VK_UP ? "SNAP_UP" : "SNAP_DOWN");
+                return new IntPtr(1);
+            }
+            if (up && key == suppressWindowsArrowUp && suppressWindowsArrowUp != 0)
+            {
+                suppressWindowsArrowUp = 0;
+                return new IntPtr(1);
+            }
             if (key == VK_TAB && down && (data.flags & LLKHF_ALTDOWN) != 0)
             {
                 suppressTabUp = true;
-                Emit(IsDown(VK_SHIFT) ? "CYCLE_REVERSE" : "CYCLE_FORWARD");
+                switcherActive = true;
+                Emit(IsDown(VK_SHIFT) ? "SWITCHER_STEP_REVERSE" : "SWITCHER_STEP_FORWARD");
                 return new IntPtr(1);
             }
             if (key == VK_TAB && up && suppressTabUp)
             {
                 suppressTabUp = false;
                 return new IntPtr(1);
+            }
+            if (switcherActive && up && IsAltKey(key))
+            {
+                switcherActive = false;
+                Emit("SWITCHER_COMMIT");
             }
         }
         return CallNextHookEx(hook, code, wParam, lParam);

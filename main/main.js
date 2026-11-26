@@ -34,7 +34,8 @@ if (!app.requestSingleInstanceLock()) app.quit();
 let mainWindow = null;
 let core = null;
 const altTabHook = createAltTabHook({
-  onCycle: (direction) => core && core.emit('app:cycleWindows', direction),
+  onSwitcher: (action, direction) => core && core.emit('app:windowSwitcher', action, direction),
+  onSnap: (direction) => core && core.emit('app:snapWindow', direction),
   onExit: () => leaveHardFullscreen(),
   onFailure: (error) => {
     if (core) {

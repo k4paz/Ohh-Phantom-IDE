@@ -4,7 +4,9 @@ import { project } from '../core/project.js';
 import { renderMarkdown } from '../core/markdown.js';
 import { confirm, fail, form, toast } from '../core/ui.js';
 import { wm } from '../core/wm.js';
-import { FLOW_ACTION_TAG, parseFlowAction } from '../core/flow-protocol.mjs';
+import {
+  FLOW_ACTION_TAG, parseFlowAction, validateRoadmapPlan, validateGoalEvidence
+} from '../core/flow-protocol.mjs';
 
 const STORE_KEY = 'agent-flows';
 const PRESET_STORE_KEY = 'agent-flow-presets';
@@ -41,7 +43,6 @@ const SIMPLE_AGENT_ROLES = [
   ['brainstormer', 'BrainStormer', 'Generate distinct, practical approaches for the assigned task, compare trade-offs, and recommend a direction with concise reasoning.'],
   ['security-engineer', 'SecurityEngineer', 'Review the assigned code for secure design, authentication, authorization, input handling, secrets, and data-protection issues. Report evidence, impact, and focused remediation.']
 ];
-const MAX_AGENTS = 6;
 const MAX_REVISION_ROUNDS = 20;
 const MAX_TASK_LENGTH = 5000;
 const MAX_ROLE_LENGTH = 3000;
@@ -182,7 +183,7 @@ function checkpointStorageKey(rootPath) {
 }
 
 export default {
-  id: 'flow', title: 'Agent Flow', icon: 'branch', desc: 'Connect agents into an orchestrated workflow',
+  id: 'flow', title: 'Agent Flow', icon: 'branch', desc: 'Manage a goal-driven team of AI agents',
   size: [1160, 780], min: [850, 560], singleton: true,
   async create(win) {
     const root = h('div.af-root.fill');
@@ -191,6 +192,7 @@ export default {
     let detectedTasks = [];
     let accountState = { providers: {}, active: {}, usage: {} };
     let accountStateLoaded = false;
+    let workerCapacity = { maxConcurrentAgents: 1, logicalCpus: 1, freeMemoryBytes: 0 };
     let busy = false;
     let cancelled = false;
     let runToken = 0;
@@ -223,8 +225,7 @@ export default {
     const projectLabel = h('span.af-project');
     const saveStatus = h('span.af-save-status', 'Loading…');
     const signInButton = h('button.btn.ghost', 'SIGN IN');
-    const addAgentButton = h('button.btn.ghost', 'ADD AGENT');
-    const runButton = h('button.btn.primary', 'RUN WORKFLOW');
+    const runButton = h('button.btn.primary', 'START AGENT RUN');
     const resumeButton = h('button.btn.ghost', { hidden: true, title: 'Resume from the latest saved checkpoint' }, 'RESUME');
     const stopButton = h('button.btn.ghost', { hidden: true }, 'STOP');
     const presetSelect = h('select.inp.af-preset-select', { 'aria-label': 'Agent Flow preset' },
@@ -241,7 +242,7 @@ export default {
       deletePresetButton
     );
     const connectionHint = h('span.af-hint', CANVAS_HINT);
-    const billingHint = h('span.af-billing-hint', 'Model overrides are per node; leave blank for the provider default. Use subscription logins; cached credential types are not inspected. Codex is read-only and Claude runs in plan mode. Copilot project-scoped permissions can auto-approve file reads/writes inside this project.');
+    const billingHint = h('span.af-billing-hint', 'The selected manager provider, subscription account, and model are shared by workers and reviewers. Provider permissions and approval prompts remain enforced.');
     const viewport = h('div.af-viewport', { tabindex: 0, 'aria-label': 'Agent Flow canvas' });
     const stage = h('div.af-stage');
     const world = h('div.af-world');
@@ -263,6 +264,27 @@ export default {
     const workspace = h('div.af-workspace', h('div.af-canvas-panel', viewport, zoomControls), inspector);
     const runStatus = h('span.af-run-status', 'IDLE');
     const results = h('div.af-results');
+    const taskInput = h('textarea.inp.af-manager-task', {
+      rows: 5, maxLength: MAX_TASK_LENGTH, placeholder: 'Describe the outcome you want. The manager will create a roadmap and delegate the work.'
+    });
+    const providerSelect = h('select.inp.af-manager-provider',
+      ...PROVIDERS.map(([id, label]) => h('option', { value: id }, label))
+    );
+    const accountSelect = h('select.inp.af-manager-account');
+    const modelInput = h('input.inp.af-manager-model', { maxLength: 128, placeholder: 'Provider default model' });
+    const reasoningSelect = h('select.inp.af-manager-reasoning');
+    const permissionSelect = h('select.inp.af-manager-permission',
+      h('option', { value: 'manual' }, 'Manual approval'),
+      h('option', { value: 'assisted' }, 'Assisted reads'),
+      h('option', { value: 'project-scoped' }, 'Project-scoped files')
+    );
+    const revisionInput = h('input.inp.af-manager-rounds', { type: 'number', min: 0, max: MAX_REVISION_ROUNDS, step: 1 });
+    const capacityStatus = h('span.af-capacity-status', 'Checking host capacity…');
+    const roadmapList = h('div.af-roadmap-list', h('div.af-empty-state', 'The manager roadmap will appear here after you start a run.'));
+    const workerList = h('div.af-worker-list', h('div.af-empty-state', 'No active workers.'));
+    const workerCount = h('span.af-section-count', '0');
+    const roadmapCount = h('span.af-section-count', '0');
+    const managerSummary = h('span.af-manager-summary-text', 'The manager will plan the request, choose how many workers it needs, integrate their changes, and iterate through checks.');
 
     function currentProjectKey() {
       return project.root || '__global__';
@@ -278,8 +300,14 @@ export default {
       resumeButton.hidden = !resumable;
       resumeButton.disabled = !resumable;
       resumeButton.title = resumable ? `Resume at ${runCheckpoint.progress || runCheckpoint.phase}` : 'Resume from the latest saved checkpoint';
-      addAgentButton.disabled = busy || workflow.nodes.filter((node) => node.type === 'agent').length >= MAX_AGENTS;
       nameInput.disabled = busy;
+      taskInput.disabled = busy;
+      providerSelect.disabled = busy;
+      accountSelect.disabled = busy;
+      modelInput.disabled = busy;
+      reasoningSelect.disabled = busy;
+      permissionSelect.disabled = busy || providerSelect.value !== 'copilot';
+      revisionInput.disabled = busy;
       stopButton.hidden = !busy;
       presetSelect.disabled = busy;
       loadPresetButton.disabled = busy || !presetSelect.value;
@@ -302,6 +330,7 @@ export default {
         el.textContent = text;
         el.className = `af-node-status${state ? ` ${state}` : ''}`;
       }
+      renderWorkerRoster();
     }
 
     function saveRunCheckpoint() {
@@ -331,6 +360,7 @@ export default {
       runCheckpoint.progress = progress;
       runCheckpoint.activeNodeId = '';
       runStatus.textContent = `RUNNING · ${progress}`;
+      managerSummary.textContent = progress;
       await saveRunCheckpoint();
       assertRunCurrent(token);
     }
@@ -339,7 +369,7 @@ export default {
       if (!project.root) return;
       await checkpointWrite;
       const saved = await call('store:get', checkpointStorageKey(project.root), null);
-      if (!saved || saved.version !== 1 || saved.projectRoot !== project.root) return;
+      if (!saved || ![1, 2].includes(saved.version) || saved.projectRoot !== project.root) return;
       runCheckpoint = saved;
       if (saved.workflowSignature !== workflowSignature(workflow)) {
         runStatus.textContent = 'CHECKPOINT OUTDATED · WORKFLOW CHANGED';
@@ -347,7 +377,7 @@ export default {
         return;
       }
       if (!['plan', 'implement', 'compiler', 'review', 'decision', 'revision', 'finalize', 'complete'].includes(saved.phase) ||
-          !['running', 'interrupted', 'stopped', 'failed', 'complete'].includes(saved.status)) {
+          !['running', 'interrupted', 'stopped', 'failed', 'blocked', 'complete'].includes(saved.status)) {
         runCheckpoint = null;
         return;
       }
@@ -357,9 +387,28 @@ export default {
       saved.values = Array.isArray(saved.values) ? saved.values : [];
       saved.reviewHistory = Array.isArray(saved.reviewHistory) ? saved.reviewHistory : [];
       saved.currentReviewResults = Array.isArray(saved.currentReviewResults) ? saved.currentReviewResults : [];
+      saved.roadmapGoals = Array.isArray(saved.roadmapGoals) ? saved.roadmapGoals : [];
+      saved.workerRoster = Array.isArray(saved.workerRoster) ? saved.workerRoster : [];
+      saved.goalEvidence = Array.isArray(saved.goalEvidence) ? saved.goalEvidence : [];
+      saved.integrationReports = Array.isArray(saved.integrationReports) ? saved.integrationReports : [];
+      saved.unresolvedConflicts = Array.isArray(saved.unresolvedConflicts) ? saved.unresolvedConflicts : [];
+      saved.workspaceIds = Array.isArray(saved.workspaceIds) ? saved.workspaceIds : [];
+      if (saved.version === 1 && saved.status !== 'complete') {
+        saved.version = 2;
+        saved.phase = 'plan';
+        saved.status = 'interrupted';
+        saved.assignments = [];
+        saved.completedWorkers = [];
+        saved.workerRoster = [];
+        saved.roadmapGoals = [];
+        saved.goalEvidence = [];
+        saved.progress = 'Legacy run migrated; the manager will create a fresh roadmap on resume';
+        await saveRunCheckpoint();
+      }
       runStates.clear();
       for (const [id, state] of Object.entries(saved.nodeStates || {})) {
-        if (nodeById(id) && state && typeof state.text === 'string') runStates.set(id, state);
+        const knownWorker = saved.workerRoster.some((worker) => worker.id === id);
+        if ((nodeById(id) || knownWorker) && state && typeof state.text === 'string') runStates.set(id, state);
       }
       if (saved.status === 'running') {
         const interruptedNode = saved.activeNodeId;
@@ -373,15 +422,22 @@ export default {
         runStatus.textContent = 'COMPLETE · SAVED RUN';
         const outputText = saved.outputText || saved.finalText;
         if (outputText) appendResult('FINAL RESPONSE · RESTORED', outputText, true, true);
+      } else if (saved.status === 'blocked') {
+        runStatus.textContent = 'BLOCKED · INCOMPLETE';
+        managerSummary.textContent = saved.progress || 'Completion gates remain unsatisfied.';
+        const outputText = saved.outputText || saved.finalText;
+        if (outputText) appendResult('BLOCKED · SAVED RUN', outputText, true, true);
       } else {
         runStatus.textContent = `${saved.status.toUpperCase()} · ${saved.progress || saved.phase}`;
         appendResult('SAVED RUN CHECKPOINT', `Progress: ${saved.progress || saved.phase}\nUpdated: ${new Date(saved.updatedAt || Date.now()).toLocaleString()}\nResume will continue from the latest completed step. An interrupted agent step may be retried.`);
       }
       for (const [id, text] of saved.values || []) {
         if (!text || id === 'task' || id === 'orchestrator') continue;
-        const node = nodeById(id);
+        const node = nodeById(id) || saved.workerRoster.find((worker) => worker.id === id);
         if (node) appendResult(`${node.label} · RESTORED OUTPUT`, text, false, true);
       }
+      renderRoadmap();
+      renderWorkerRoster();
     }
 
     async function writeWorkflow(key, value) {
@@ -510,6 +566,7 @@ export default {
       nameInput.value = workflow.name;
       centerGraph(true);
       renderGraph();
+      syncManagerControls();
       scheduleSave();
     }
 
@@ -611,7 +668,10 @@ export default {
           if (!PROVIDERS.some(([id]) => id === node.provider)) node.provider = 'copilot';
           node.instructions = typeof node.instructions === 'string' ? node.instructions : '';
           node.model = typeof node.model === 'string' ? node.model : '';
-          node.reasoningEffort = typeof node.reasoningEffort === 'string' ? node.reasoningEffort : '';
+          node.reasoningEffort = typeof node.reasoningEffort === 'string' &&
+            REASONING_EFFORTS[node.provider].includes(node.reasoningEffort)
+            ? node.reasoningEffort
+            : '';
           node.webSearchMode = ['disabled', 'cached', 'live'].includes(node.webSearchMode) ? node.webSearchMode : 'disabled';
           node.agentMode = AGENT_MODES.some(([mode]) => mode === node.agentMode) ? node.agentMode : 'plan';
           node.permissionMode = node.provider === 'copilot' && ['manual', 'assisted', 'project-scoped'].includes(node.permissionMode)
@@ -668,6 +728,9 @@ export default {
       await loadRunCheckpoint();
       centerGraph(true);
       renderGraph();
+      syncManagerControls();
+      renderRoadmap();
+      renderWorkerRoster();
       updateControls();
       if (!saved || migrated || repairedAccount || repairedWorkflow) scheduleSave();
     }
@@ -817,6 +880,75 @@ export default {
 
     function accountsFor(provider) {
       return accountState.providers[provider] || [{ id: 'default', name: 'Default CLI login' }];
+    }
+
+    function renderManagerAccountOptions() {
+      const selectedProvider = providerSelect.value || nodeById('orchestrator')?.provider || 'copilot';
+      const profiles = accountsFor(selectedProvider);
+      accountSelect.replaceChildren(...profiles.map((profile) =>
+        h('option', { value: profile.id }, profile.name)
+      ));
+      const orchestrator = nodeById('orchestrator');
+      accountSelect.value = orchestrator?.accountId || accountState.active[selectedProvider] || profiles[0]?.id || 'default';
+    }
+
+    function syncManagerControls() {
+      const input = workflow.nodes.find((node) => node.type === 'input');
+      const orchestrator = workflow.nodes.find((node) => node.type === 'orchestrator');
+      if (input && document.activeElement !== taskInput) taskInput.value = input.prompt || '';
+      if (orchestrator) {
+        providerSelect.value = orchestrator.provider;
+        modelInput.value = orchestrator.model === 'auto' ? '' : orchestrator.model || '';
+        reasoningSelect.replaceChildren(
+          h('option', { value: '' }, 'Provider default'),
+          ...REASONING_EFFORTS[orchestrator.provider].map((effort) => h('option', { value: effort }, effort.toUpperCase()))
+        );
+        reasoningSelect.value = orchestrator.reasoningEffort || '';
+        permissionSelect.value = orchestrator.provider === 'copilot' ? orchestrator.permissionMode || 'manual' : 'manual';
+        revisionInput.value = String(orchestrator.revisionRounds ?? 3);
+      }
+      renderManagerAccountOptions();
+      capacityStatus.textContent = `${workerCapacity.recommendedConcurrentAgents || workerCapacity.maxConcurrentAgents} active worker${(workerCapacity.recommendedConcurrentAgents || workerCapacity.maxConcurrentAgents) === 1 ? '' : 's'} at a time · ${workerCapacity.logicalCpus} logical CPU${workerCapacity.logicalCpus === 1 ? '' : 's'}`;
+      updateControls();
+    }
+
+    function renderRoadmap() {
+      const goals = runCheckpoint?.roadmapGoals || [];
+      roadmapCount.textContent = String(goals.length);
+      if (!goals.length) {
+        roadmapList.replaceChildren(h('div.af-empty-state', 'The manager roadmap will appear here after you start a run.'));
+        return;
+      }
+      const evidence = new Map((runCheckpoint.goalEvidence || []).map((item) => [item.goalId, item.evidence]));
+      roadmapList.replaceChildren(...goals.map((goal, index) => h('article.af-goal',
+        h('div.af-goal-head',
+          h('span.af-goal-index', String(index + 1).padStart(2, '0')),
+          h('strong', goal.title),
+          h('span.af-goal-state' + (evidence.has(goal.id) ? '.done' : ''), evidence.has(goal.id) ? 'VERIFIED' : 'IN PROGRESS')
+        ),
+        h('ul', ...goal.acceptanceCriteria.map((criterion) => h('li', criterion))),
+        evidence.has(goal.id) ? h('p.af-goal-evidence', evidence.get(goal.id)) : null
+      )));
+    }
+
+    function renderWorkerRoster() {
+      const workers = runCheckpoint?.workerRoster || [];
+      workerCount.textContent = String(workers.length);
+      if (!workers.length) {
+        workerList.replaceChildren(h('div.af-empty-state', 'No active workers.'));
+        return;
+      }
+      workerList.replaceChildren(...workers.map((worker, index) => {
+        const status = runStates.get(worker.id) || { text: 'QUEUED', state: '' };
+        return h('article.af-worker',
+          h('span.af-worker-index', String(index + 1).padStart(2, '0')),
+          h('div.af-worker-info',
+            h('strong', worker.label),
+            h('span', `${worker.provider || 'manager provider'} · ${worker.goalIds?.length || 0} roadmap goal${worker.goalIds?.length === 1 ? '' : 's'}`)
+          ),
+          h(`span.af-worker-state${status.state ? ` ${status.state}` : ''}`, status.text)
+        );
+      }));
     }
 
     function effectiveAccountId(node) {
@@ -1571,10 +1703,6 @@ export default {
 
     function addAgent() {
       const count = workflow.nodes.filter((node) => node.type === 'agent').length;
-      if (count >= MAX_AGENTS) {
-        toast(`A workflow supports up to ${MAX_AGENTS} agent nodes.`, 'warn');
-        return;
-      }
       const id = `agent-${Date.now()}-${count}`;
       const node = {
         id, type: 'agent', role: 'worker', provider: 'copilot', model: 'auto', reasoningEffort: '', label: `Specialist ${count + 1}`,
@@ -1603,10 +1731,9 @@ export default {
       const agents = workflow.nodes.filter((node) => node.type === 'agent');
       const workers = agents.filter((node) => node.role === 'worker');
       const reviewers = agents.filter((node) => node.role === 'reviewer');
-      if (inputs.length !== 1 || outputs.length !== 1 || orchestrators.length !== 1 || compilers.length !== 1 || !workers.length) {
-        throw new Error('A workflow needs one task, one orchestrator, one compiler, one output, and at least one worker.');
+      if (inputs.length !== 1 || outputs.length !== 1 || orchestrators.length !== 1 || compilers.length !== 1) {
+        throw new Error('Agent Flow needs one task, one manager, one compiler, and one result node.');
       }
-      if (agents.length > MAX_AGENTS) throw new Error(`A workflow supports up to ${MAX_AGENTS} agent nodes.`);
       const input = inputs[0];
       const output = outputs[0];
       const orchestrator = orchestrators[0];
@@ -1635,11 +1762,6 @@ export default {
       if (!input.prompt || !input.prompt.trim()) throw new Error('Enter a task in the Task node before running the workflow.');
       if (!pathExists(orchestrator.id, output.id)) throw new Error('Connect the orchestrator to the output node.');
       if (!pathExists(compiler.id, orchestrator.id)) throw new Error('Connect the compiler to the orchestrator.');
-      for (const agent of agents) {
-        if (!pathExists(input.id, agent.id) || !pathExists(agent.id, orchestrator.id)) {
-          throw new Error(`Connect "${agent.label}" from the task node to the orchestrator.`);
-        }
-      }
       return { input, output, orchestrator, compiler, workers, reviewers, agents, order };
     }
 
@@ -1723,7 +1845,7 @@ export default {
       active.toolActivity.hidden = false;
     }
 
-    async function runAgent(node, prompt, token, stage = '') {
+    async function runAgent(node, prompt, token, stage = '', cwd = project.root) {
       assertRunCurrent(token);
       setNodeStatus(node.id, 'STARTING', 'running');
       if (runCheckpoint) {
@@ -1740,7 +1862,7 @@ export default {
       const toolActivity = h('details.af-tool-activity', { hidden: true }, toolActivitySummary, toolActivityList);
       const changeView = h('div.af-result-changes', { hidden: true });
       resultDetails.append(toolActivity, changeView);
-      const created = await call('agent:create', node.provider, project.root, {
+      const created = await call('agent:create', node.provider, cwd, {
         accountId: node.accountId || '',
         model: node.model || '',
         reasoningEffort: node.agentRoleMode === 'advanced' ? node.reasoningEffort || '' : '',
@@ -1859,45 +1981,116 @@ export default {
     }
 
     async function runAssignments(assignments, plan, values, token, stage, context, clarifications) {
-      const workerIds = new Set(plan.workers.map((worker) => worker.id));
-      const orderedWorkers = plan.order.map(nodeById).filter((node) => workerIds.has(node?.id));
-      for (const worker of orderedWorkers) {
+      const byId = new Map(plan.workers.map((worker) => [worker.id, worker]));
+      const unknownWorkers = [...assignments.keys()].filter((id) => !byId.has(id));
+      if (unknownWorkers.length) throw new Error(`Saved assignments refer to unknown workers: ${unknownWorkers.join(', ')}.`);
+      const pending = [...assignments.entries()]
+        .map(([id, task]) => ({ worker: byId.get(id), task }))
+        .filter((item) => item.worker && !(runCheckpoint.completedWorkers.includes(item.worker.id) && values.has(item.worker.id)));
+      for (const worker of plan.workers) {
+        if (!assignments.has(worker.id)) setNodeStatus(worker.id, 'NOT ASSIGNED');
+        else if (runCheckpoint.completedWorkers.includes(worker.id) && values.has(worker.id)) setNodeStatus(worker.id, 'DONE', 'done');
+      }
+      if (!pending.length) return;
+      const capacity = await call('agent:capacity');
+      const recommended = capacity.recommendedConcurrentAgents || capacity.maxConcurrentAgents;
+      const availableSlots = recommended - capacity.activeAgents;
+      if (availableSlots < 1) {
+        throw new Error('No worker capacity is available. Close an active agent chat and resume the run.');
+      }
+      const batchSize = Math.max(1, Math.min(recommended, availableSlots));
+      runCheckpoint.integrationReports = Array.isArray(runCheckpoint.integrationReports) ? runCheckpoint.integrationReports : [];
+      runCheckpoint.unresolvedConflicts = Array.isArray(runCheckpoint.unresolvedConflicts) ? runCheckpoint.unresolvedConflicts : [];
+      runCheckpoint.workspaceIds = Array.isArray(runCheckpoint.workspaceIds) ? runCheckpoint.workspaceIds : [];
+
+      for (let offset = 0; offset < pending.length; offset += batchSize) {
         assertRunCurrent(token);
-        if (!assignments.has(worker.id)) {
-          setNodeStatus(worker.id, 'NOT ASSIGNED');
-          continue;
+        const batch = pending.slice(offset, offset + batchSize);
+        const workspaces = [];
+        try {
+          const baseWorkspace = await call('flow:workspace:create', project.root);
+          workspaces.push({ worker: batch[0].worker, ...baseWorkspace });
+          runCheckpoint.workspaceIds.push(baseWorkspace.id);
+          await saveRunCheckpoint();
+          assertRunCurrent(token);
+          for (const { worker } of batch.slice(1)) {
+            assertRunCurrent(token);
+            const workspace = await call('flow:workspace:clone', baseWorkspace.id);
+            workspaces.push({ worker, ...workspace });
+            runCheckpoint.workspaceIds.push(workspace.id);
+            await saveRunCheckpoint();
+          }
+          runCheckpoint.progress = `${stage} · starting ${batch.length} parallel worker${batch.length === 1 ? '' : 's'}`;
+          await saveRunCheckpoint();
+          const results = await Promise.allSettled(batch.map(async ({ worker, task }, index) => {
+            assertRunCurrent(token);
+            setNodeStatus(worker.id, 'STARTING', 'running');
+            const workspace = workspaces[index];
+            const upstream = reachableInputText(worker, values);
+            const prompt = [
+              `You are "${worker.label}", a coworker in the PHANTOM manager-led project "${workflow.name}".`,
+              `Your scoped assignment:\n${task}`,
+              `Roadmap goals owned by this assignment:\n${(worker.goalIds || []).join(', ') || 'Support the manager roadmap.'}`,
+              `Worker instructions:\n${roleInstructions(worker) || 'Complete the assigned task and report what changed.'}`,
+              `Agent mode:\n${modeInstruction(worker)}`,
+              `Original user task:\n${plan.input.prompt.trim()}`,
+              clarifications.length ? `User clarifications:\n${formatClarifications(clarifications)}` : '',
+              context ? `Review, integration, and compiler feedback to address:\n${context}` : '',
+              upstream ? `Connected upstream results:\n${upstream}` : '',
+              runCheckpoint.resumeMode ? 'This is a resumed assignment. Inspect the current project snapshot first and continue idempotently.' : '',
+              'Work only in this isolated workspace and within your assigned scope. Report concrete changes, checks performed, and remaining blockers.'
+            ].filter(Boolean).join('\n\n');
+            const result = await runAgent(worker, prompt, token, stage, workspace.root);
+            assertRunCurrent(token);
+            return { worker, result };
+          }));
+          const failed = results.find((result) => result.status === 'rejected');
+          if (failed) throw failed.reason;
+
+          for (let index = 0; index < results.length; index++) {
+            assertRunCurrent(token);
+            const { worker, result } = results[index].value;
+            values.set(worker.id, result.text);
+            runCheckpoint.values = [...values.entries()];
+            const workspace = workspaces[index];
+            setNodeStatus(worker.id, 'INTEGRATING', 'running');
+            const integrated = await call('flow:workspace:integrate', project.root, workspace.id);
+            const conflicts = Array.isArray(integrated.conflicts) ? integrated.conflicts : [];
+            const report = {
+              workerId: worker.id,
+              applied: integrated.applied || [],
+              conflicts,
+              error: integrated.error || ''
+            };
+            runCheckpoint.integrationReports.push(report);
+            runCheckpoint.completedWorkers = [...new Set([...runCheckpoint.completedWorkers, worker.id])];
+            runCheckpoint.unresolvedConflicts = [
+              ...new Set([
+                ...runCheckpoint.unresolvedConflicts.filter((file) => !report.applied.includes(file)),
+                ...conflicts
+              ])
+            ];
+            const summary = conflicts.length
+              ? `Integration paused for ${conflicts.length} overlapping file${conflicts.length === 1 ? '' : 's'}: ${conflicts.join(', ')}`
+              : `Integrated ${report.applied.length} changed file${report.applied.length === 1 ? '' : 's'}.`;
+            const fileDetails = report.applied.length ? `\nApplied:\n${report.applied.join('\n')}` : '';
+            appendResult(`${worker.label} · ${conflicts.length ? 'INTEGRATION CONFLICT' : 'INTEGRATED'}`, `${summary}${fileDetails}${report.error ? `\n${report.error}` : ''}`);
+            setNodeStatus(worker.id, conflicts.length ? 'INTEGRATION CONFLICT' : 'INTEGRATED', conflicts.length ? 'error' : 'done');
+            runCheckpoint.activeNodeId = '';
+            runCheckpoint.progress = `${stage} · ${worker.label} ${conflicts.length ? 'has conflicts' : 'integrated'}`;
+            await saveRunCheckpoint();
+          }
+        } finally {
+          for (const workspace of workspaces) {
+            try {
+              await call('flow:workspace:dispose', workspace.id);
+              runCheckpoint.workspaceIds = runCheckpoint.workspaceIds.filter((id) => id !== workspace.id);
+              await saveRunCheckpoint();
+            } catch (error) {
+              fail(error, 'CLEAN UP WORKER WORKSPACE');
+            }
+          }
         }
-        if (runCheckpoint.completedWorkers.includes(worker.id) && values.has(worker.id)) {
-          setNodeStatus(worker.id, 'DONE', 'done');
-          continue;
-        }
-        if (cancelled || token !== runToken) throw new Error('Workflow was cancelled.');
-        const task = assignments.get(worker.id);
-        runCheckpoint.activeNodeId = worker.id;
-        runCheckpoint.progress = `${stage} · ${worker.label}`;
-        runStatus.textContent = `RUNNING · ${runCheckpoint.progress}`;
-        await saveRunCheckpoint();
-        const upstream = reachableInputText(worker, values);
-        const prompt = [
-          `You are "${worker.label}", a worker in the PHANTOM workflow "${workflow.name}".`,
-          `Your scoped assignment:\n${task}`,
-          `Worker instructions:\n${roleInstructions(worker) || 'Complete the assigned task and report what changed.'}`,
-          `Agent mode:\n${modeInstruction(worker)}`,
-          `Original user task:\n${plan.input.prompt.trim()}`,
-          clarifications.length ? `User clarifications:\n${formatClarifications(clarifications)}` : '',
-          context ? `Review and compiler feedback to address:\n${context}` : '',
-          upstream ? `Connected upstream results:\n${upstream}` : '',
-          runCheckpoint.resumeMode ? 'This is a resumed assignment. Inspect the current project state first; earlier interrupted work may have partially changed files. Continue idempotently and preserve completed work.' : '',
-          'Work only on your assigned scope. If changes are allowed by your agent mode, make and verify focused edits. Report files changed, checks performed, and any remaining blockers or questions.'
-        ].filter(Boolean).join('\n\n');
-        const result = await runAgent(worker, prompt, token, stage);
-        assertRunCurrent(token);
-        values.set(worker.id, result.text);
-        runCheckpoint.values = [...values.entries()];
-        runCheckpoint.completedWorkers = [...new Set([...runCheckpoint.completedWorkers, worker.id])];
-        runCheckpoint.activeNodeId = '';
-        runCheckpoint.progress = `${stage} · ${worker.label} complete`;
-        await saveRunCheckpoint();
       }
     }
 
@@ -2033,7 +2226,7 @@ export default {
           await clearRunCheckpoint();
           assertRunCurrent(token);
           runCheckpoint = {
-            version: 1,
+            version: 2,
             projectRoot: project.root,
             workflowSignature: workflowSignature(workflow),
             status: 'running',
@@ -2045,6 +2238,13 @@ export default {
             revisionRoundsUsed: 0,
             assignments: [],
             completedWorkers: [],
+            roadmapGoals: [],
+            workerRoster: [],
+            goalEvidence: [],
+            integrationReports: [],
+            unresolvedConflicts: [],
+            workspaceIds: [],
+            checksPassed: false,
             clarifications: [],
             values: [[plan.input.id, plan.input.prompt.trim()]],
             reviewHistory: [],
@@ -2060,6 +2260,10 @@ export default {
           await saveRunCheckpoint();
           assertRunCurrent(token);
         } else {
+          for (const workspaceId of runCheckpoint.workspaceIds || []) {
+            await call('flow:workspace:dispose', workspaceId);
+          }
+          runCheckpoint.workspaceIds = [];
           runCheckpoint.status = 'running';
           runCheckpoint.resumeMode = true;
           runCheckpoint.lastError = '';
@@ -2075,17 +2279,61 @@ export default {
         const clarifications = Array.isArray(runCheckpoint.clarifications) ? [...runCheckpoint.clarifications] : [];
         const reviewHistory = Array.isArray(runCheckpoint.reviewHistory) ? [...runCheckpoint.reviewHistory] : [];
         let revisionRoundsUsed = Number.isInteger(runCheckpoint.revisionRoundsUsed) ? runCheckpoint.revisionRoundsUsed : 0;
-        const workerRoster = plan.workers.map((worker) => ({
-          id: worker.id, label: worker.label, instructions: roleInstructions(worker), mode: worker.agentMode
-        }));
+        const manager = plan.orchestrator;
+        const useManagerProvider = (node, role, index) => ({
+          ...node,
+          id: role === 'worker' ? node.id : `${role}-${index + 1}`,
+          role,
+          provider: manager.provider,
+          accountId: manager.accountId || accountState.active[manager.provider] || 'default',
+          model: manager.model === 'auto' ? '' : manager.model || '',
+          reasoningEffort: manager.reasoningEffort || '',
+          webSearchMode: manager.provider === 'codex' ? manager.webSearchMode || 'disabled' : 'disabled',
+          agentMode: role === 'reviewer' ? 'plan' : role === 'worker' ? 'autopilot' : manager.agentMode,
+          permissionMode: manager.provider === 'copilot' ? manager.permissionMode || 'manual' : 'manual',
+          enableMcp: manager.provider === 'copilot' && manager.enableMcp === true
+        });
+        if (resume && Array.isArray(runCheckpoint.workerRoster) && runCheckpoint.workerRoster.length) {
+          plan.workers = runCheckpoint.workerRoster.map((worker) => ({ ...worker }));
+        }
+        plan.reviewers = (plan.reviewers.length
+          ? plan.reviewers
+          : [{ id: 'manager-reviewer', type: 'agent', label: 'Independent reviewer', instructions: 'Review correctness, regression risk, and acceptance criteria. Report actionable findings only; do not edit files.' }]
+        ).map((reviewer, index) => useManagerProvider(reviewer, 'reviewer', index));
         const actionProtocol = [
           `Return exactly one JSON action inside <${FLOW_ACTION_TAG}>...</${FLOW_ACTION_TAG}>.`,
           `For clarification: {"action":"ask_user","question":"one concise question"}.`,
-          `To delegate: {"action":"delegate","summary":"plan summary","assignments":[{"workerId":"worker node id","task":"scoped assignment"}]}.`,
+          `To create the roadmap and delegate: {"action":"delegate","summary":"plan summary","goals":[{"id":"goal-id","title":"measurable outcome","acceptanceCriteria":["observable condition"]}],"assignments":[{"workerId":"unique-id","label":"specialist name","role":"specialty","instructions":"optional role guidance","task":"scoped work","goalIds":["goal-id"]}]}.`,
           `To request changes: {"action":"revise","summary":"revision summary","assignments":[{"workerId":"worker node id","task":"specific fix"}]}.`,
-          `To finish: {"action":"complete","summary":"completion summary","finalResponse":"evidence-based response"}.`,
-          'Use only worker node IDs listed below. Assign distinct, concrete work. Ask the user when requirements are ambiguous rather than guessing.'
+          `To finish: {"action":"complete","summary":"completion summary","goalEvidence":[{"goalId":"goal-id","evidence":"specific implementation or check evidence"}],"finalResponse":"evidence-based response"}.`,
+          'Choose as many coworker assignments as the task needs; there is no fixed worker roster. Assign each measurable goal to at least one worker, use distinct scoped tasks, and ask the user when requirements are ambiguous.'
         ].join('\n');
+        const workerRosterSummary = () => plan.workers.map((worker) => ({
+          id: worker.id, label: worker.label, role: worker.specialty || 'specialist',
+          goalIds: worker.goalIds || [], provider: worker.provider
+        }));
+        const integrationSummary = () => {
+          const reports = runCheckpoint.integrationReports || [];
+          const unresolved = runCheckpoint.unresolvedConflicts || [];
+          const completed = reports.map((report) =>
+            `${report.workerId}: applied ${report.applied.length}; conflicts ${report.conflicts.length}`
+          );
+          return [
+            completed.length ? `Worker integration:\n${completed.join('\n')}` : 'No integration reports yet.',
+            unresolved.length ? `Unresolved project conflicts:\n${unresolved.join('\n')}` : 'No unresolved file conflicts.'
+          ].join('\n\n');
+        };
+        const completionGate = (decision) => {
+          const reasons = [];
+          let evidence = [];
+          try { evidence = validateGoalEvidence(decision.goalEvidence, runCheckpoint.roadmapGoals || []); }
+          catch (error) { reasons.push(error.message); }
+          if (runCheckpoint.checksPassed !== true) reasons.push('Required build and test checks have not passed.');
+          if (runCheckpoint.unresolvedConflicts?.length) {
+            reasons.push(`Unresolved integration conflicts: ${runCheckpoint.unresolvedConflicts.join(', ')}.`);
+          }
+          return { evidence, reasons };
+        };
 
         if (runCheckpoint.phase === 'plan') {
           await setCheckpointPhase('plan', 'Planning workflow', token);
@@ -2094,15 +2342,41 @@ export default {
             `Your role:\n${roleInstructions(plan.orchestrator) || 'Clarify the request, divide work among workers, and coordinate completion.'}`,
             `Agent mode:\n${modeInstruction(plan.orchestrator)}`,
             `User request:\n${plan.input.prompt.trim()}`,
-            `Available worker nodes:\n${JSON.stringify(workerRoster, null, 2)}`,
             actionProtocol,
-            'First decide whether you need clarification. Otherwise create a concise plan and return scoped assignments; do not perform implementation work yourself.'
+            'First decide whether you need clarification. Otherwise create a measurable roadmap with acceptance criteria and an assignment for each area of work. Choose the coworker count yourself; do not perform implementation work yourself.'
           ].join('\n\n');
           const planAction = await runCoordinator(plan, planningPrompt, token, ['delegate'], 'PLAN', clarifications);
           assertRunCurrent(token);
-          const assignments = validateAssignments(planAction, plan.workers);
-          const planSummary = typeof planAction.summary === 'string' ? planAction.summary.trim() : '';
+          const roadmapPlan = validateRoadmapPlan(planAction);
+          const assignments = new Map(roadmapPlan.assignments.map((assignment) => [assignment.workerId, assignment.task]));
+          plan.workers = roadmapPlan.assignments.map((assignment, index) => useManagerProvider({
+            id: assignment.workerId,
+            type: 'agent',
+            role: 'worker',
+            label: assignment.label || `Worker ${String(index + 1).padStart(2, '0')}`,
+            agentRoleMode: 'advanced',
+            simpleRole: 'backend',
+            agentMode: 'autopilot',
+            permissionMode: manager.permissionMode || 'manual',
+            webSearchMode: 'disabled',
+            enableMcp: manager.enableMcp === true,
+            model: manager.model || '',
+            reasoningEffort: manager.reasoningEffort || '',
+            accountId: manager.accountId || '',
+            instructions: assignment.instructions || `${assignment.role || 'Implementation specialist'}. Focus on goals: ${assignment.goalIds.join(', ')}.`,
+            goalIds: assignment.goalIds,
+            specialty: assignment.role
+          }, 'worker', index));
+          const planSummary = roadmapPlan.summary;
           if (planSummary) appendResult('ORCHESTRATOR · DELEGATION PLAN', planSummary, false, true);
+          runCheckpoint.roadmapGoals = roadmapPlan.goals;
+          runCheckpoint.workerRoster = plan.workers;
+          runCheckpoint.goalEvidence = [];
+          runCheckpoint.integrationReports = [];
+          runCheckpoint.unresolvedConflicts = [];
+          runCheckpoint.checksPassed = false;
+          renderRoadmap();
+          renderWorkerRoster();
           runCheckpoint.assignments = [...assignments.entries()];
           runCheckpoint.completedWorkers = [];
           runCheckpoint.planSummary = planSummary;
@@ -2143,6 +2417,7 @@ export default {
             const compilerResult = await runCompiler(plan.compiler, token);
             assertRunCurrent(token);
             values.set(plan.compiler.id, compilerResult.text);
+            runCheckpoint.checksPassed = compilerResult.ok === true;
             runCheckpoint.values = [...values.entries()];
             runCheckpoint.currentReviewResults = [];
             runCheckpoint.currentRound = revisionRoundsUsed + 1;
@@ -2153,7 +2428,7 @@ export default {
           }
 
           if (runCheckpoint.phase === 'review') {
-            const compilerReport = values.get(plan.compiler.id) || '';
+            const compilerReport = `${values.get(plan.compiler.id) || ''}\n\n${integrationSummary()}`;
             const implementationReports = plan.workers
               .filter((worker) => values.has(worker.id))
               .map((worker) => `## ${worker.label} (${worker.provider})\n${String(values.get(worker.id)).slice(0, 3500)}`)
@@ -2200,7 +2475,7 @@ export default {
           }
 
           if (runCheckpoint.phase === 'decision') {
-            const compilerReport = values.get(plan.compiler.id) || '';
+            const compilerReport = `${values.get(plan.compiler.id) || ''}\n\n${integrationSummary()}`;
             const implementationReports = plan.workers
               .filter((worker) => values.has(worker.id))
               .map((worker) => `## ${worker.label} (${worker.provider})\n${String(values.get(worker.id)).slice(0, 3500)}`)
@@ -2216,15 +2491,16 @@ export default {
                 `Original user request:\n${plan.input.prompt.trim()}`,
                 clarifications.length ? `User clarifications:\n${formatClarifications(clarifications)}` : '',
                 `Implementation reports:\n${implementationReports}`,
+                `Roadmap goals and acceptance criteria:\n${JSON.stringify(runCheckpoint.roadmapGoals, null, 2)}`,
                 `Reviewer feedback for this round:\n${roundReview}`,
                 `Compiler/build/test results:\n${compilerReport}`,
-                `Available worker nodes:\n${JSON.stringify(workerRoster, null, 2)}`,
+                `Current workers:\n${JSON.stringify(workerRosterSummary(), null, 2)}`,
                 `Revision rounds used: ${revisionRoundsUsed}; maximum allowed: ${plan.orchestrator.revisionRounds}.`,
                 `Further revision assignments allowed: ${canRevise ? 'yes' : 'no'}.`,
                 actionProtocol,
                 canRevise
-                  ? 'If a specific change is needed, request a revision from one or more workers. If the work is complete, finish with an evidence-based finalResponse. Ask the user if a decision is blocked by ambiguity.'
-                  : 'The revision limit has been reached. Do not request further revisions; finish with a truthful finalResponse that reports any unresolved findings and verification status. You may still ask the user if a critical decision is ambiguous.'
+                  ? 'If a specific change or integration conflict remains, request targeted work from one or more current workers. Only finish when every goal meets its acceptance criteria, required checks pass, and conflicts are resolved. Include evidence for every goal.'
+                  : 'The revision limit has been reached. Do not request further revisions; report an incomplete result if any goal, check, or integration conflict remains. Include evidence for every goal you can verify.'
               ].join('\n\n');
               decision = await runCoordinator(
                 plan, decisionPrompt, token,
@@ -2254,6 +2530,7 @@ export default {
             const feedback = [
               `Most recent reviewer findings:\n${roundReview}`,
               `Latest build and test output:\n${compilerReport}`,
+              `Integration status:\n${integrationSummary()}`,
               `Previous review rounds:\n${reviewHistory.slice(0, -1).join('\n\n').slice(-8000)}`
             ].filter(Boolean).join('\n\n');
             revisionRoundsUsed += 1;
@@ -2267,7 +2544,19 @@ export default {
           }
 
           if (runCheckpoint.phase === 'finalize') {
-            finalText = runCheckpoint.finalText || finalText;
+            const decision = runCheckpoint.pendingDecision || {};
+            const gate = completionGate(decision);
+            runCheckpoint.goalEvidence = gate.evidence;
+            if (gate.reasons.length) {
+              runCheckpoint.status = 'blocked';
+              runCheckpoint.blockReasons = gate.reasons;
+              finalText = `BLOCKED · ROADMAP INCOMPLETE\n\n${runCheckpoint.finalText || finalText}\n\nOutstanding completion gates:\n${gate.reasons.map((reason) => `- ${reason}`).join('\n')}`;
+            } else {
+              runCheckpoint.status = 'running';
+              runCheckpoint.blockReasons = [];
+              finalText = runCheckpoint.finalText || finalText;
+            }
+            renderRoadmap();
             break;
           }
           throw new Error(`The saved workflow checkpoint has an unsupported phase: ${runCheckpoint.phase}`);
@@ -2285,25 +2574,30 @@ export default {
             ? text
             : `## ${node.label}${node.provider ? ` (${node.provider})` : ''}\n${text}`;
         }).join('\n\n');
-        setNodeStatus(plan.output.id, 'DONE', 'done');
-        const outputTitle = outputSources.length === 1 && outputSources[0].id === plan.orchestrator.id
+        const blocked = runCheckpoint.status === 'blocked';
+        setNodeStatus(plan.output.id, blocked ? 'BLOCKED' : 'DONE', blocked ? 'error' : 'done');
+        const outputTitle = blocked
+          ? `${plan.output.label} · BLOCKED`
+          : outputSources.length === 1 && outputSources[0].id === plan.orchestrator.id
           ? `${plan.output.label} · ORCHESTRATED`
           : `${plan.output.label} · ${outputSources.length} CONNECTED SOURCES`;
         appendResult(outputTitle, outputText, true, true);
         runCheckpoint.values = [...values.entries()];
         runCheckpoint.outputText = outputText;
         runCheckpoint.finalText = finalText;
-        runCheckpoint.phase = 'complete';
-        runCheckpoint.status = 'complete';
-        runCheckpoint.progress = 'Workflow completed';
+        runCheckpoint.phase = blocked ? 'finalize' : 'complete';
+        runCheckpoint.status = blocked ? 'blocked' : 'complete';
+        runCheckpoint.progress = blocked ? 'Blocked · completion gates remain' : 'Workflow completed';
         runCheckpoint.activeNodeId = '';
         await saveRunCheckpoint();
         assertRunCurrent(token);
-        runStatus.textContent = 'COMPLETE';
+        runStatus.textContent = blocked ? 'BLOCKED · INCOMPLETE' : 'COMPLETE';
+        managerSummary.textContent = runCheckpoint.progress;
       } catch (error) {
         if (token === runToken) {
           const stopped = cancelled || /cancel|abort/i.test(String(error.message || error));
           runStatus.textContent = stopped ? 'STOPPED' : 'FAILED';
+          managerSummary.textContent = stopped ? 'Run stopped. Completed integrations are preserved; unfinished worker snapshots are discarded.' : `Run failed: ${error.message || error}`;
           if (runCheckpoint) {
             runCheckpoint.status = stopped ? 'stopped' : 'failed';
             runCheckpoint.progress = `${runCheckpoint.progress || runCheckpoint.phase}${stopped ? ' · stopped' : ' · failed'}`;
@@ -2334,6 +2628,7 @@ export default {
       if (!busy) return;
       cancelled = true;
       runStatus.textContent = 'STOPPING…';
+      managerSummary.textContent = 'Stopping active agents and safely discarding their unintegrated snapshots…';
       for (const id of activeConversations.keys()) {
         call('agent:cancel', id).catch((error) => fail(error, 'STOP WORKFLOW AGENT'));
       }
@@ -2362,6 +2657,7 @@ export default {
       runStates.clear();
       runStatus.textContent = 'IDLE';
       renderGraph();
+      syncManagerControls();
       scheduleSave();
     }
 
@@ -2443,7 +2739,6 @@ export default {
       scheduleSave();
     });
     signInButton.addEventListener('click', () => wm.open('agents').catch((error) => fail(error, 'OPEN AGENTS')));
-    addAgentButton.addEventListener('click', addAgent);
     runButton.addEventListener('click', runWorkflow);
     resumeButton.addEventListener('click', () => runWorkflow({ resume: true }));
     stopButton.addEventListener('click', () => stopWorkflow().catch((error) => fail(error, 'SAVE FLOW CHECKPOINT')));
@@ -2482,15 +2777,99 @@ export default {
       event.preventDefault();
       setZoom(zoom * Math.exp(-event.deltaY * 0.001), event.clientX, event.clientY);
     }, { passive: false });
+    taskInput.addEventListener('input', () => {
+      const input = workflow.nodes.find((node) => node.type === 'input');
+      if (!input) return;
+      input.prompt = taskInput.value;
+      scheduleSave();
+    });
+    providerSelect.addEventListener('change', () => {
+      const orchestrator = nodeById('orchestrator');
+      if (!orchestrator) return;
+      orchestrator.provider = providerSelect.value;
+      orchestrator.accountId = accountState.active[orchestrator.provider] || '';
+      orchestrator.model = '';
+      orchestrator.reasoningEffort = '';
+      orchestrator.permissionMode = 'manual';
+      orchestrator.webSearchMode = 'disabled';
+      orchestrator.enableMcp = false;
+      syncManagerControls();
+      scheduleSave();
+    });
+    accountSelect.addEventListener('change', () => {
+      const orchestrator = nodeById('orchestrator');
+      if (!orchestrator) return;
+      orchestrator.accountId = accountSelect.value;
+      scheduleSave();
+    });
+    modelInput.addEventListener('input', () => {
+      const orchestrator = nodeById('orchestrator');
+      if (!orchestrator) return;
+      orchestrator.model = modelInput.value.trim() || 'auto';
+      scheduleSave();
+    });
+    reasoningSelect.addEventListener('change', () => {
+      const orchestrator = nodeById('orchestrator');
+      if (!orchestrator) return;
+      orchestrator.reasoningEffort = reasoningSelect.value;
+      scheduleSave();
+    });
+    permissionSelect.addEventListener('change', () => {
+      const orchestrator = nodeById('orchestrator');
+      if (!orchestrator) return;
+      orchestrator.permissionMode = providerSelect.value === 'copilot' ? permissionSelect.value : 'manual';
+      scheduleSave();
+    });
+    revisionInput.addEventListener('change', () => {
+      const orchestrator = nodeById('orchestrator');
+      if (!orchestrator) return;
+      orchestrator.revisionRounds = Math.max(0, Math.min(MAX_REVISION_ROUNDS, Number.parseInt(revisionInput.value, 10) || 0));
+      revisionInput.value = String(orchestrator.revisionRounds);
+      scheduleSave();
+    });
     root.append(
       h('div.af-header',
-        h('div.af-heading', h('div.af-eyebrow', 'VISUAL AGENT ORCHESTRATION'), h('h2', 'Agent Flow'), projectLabel),
-        h('div.af-toolbar', nameInput, saveStatus, signInButton, addAgentButton, runButton, resumeButton, stopButton)
+        h('div.af-heading', h('div.af-eyebrow', 'MANAGER-LED AGENT SYSTEM'), h('h2', 'Agent Flow'), projectLabel),
+        h('div.af-toolbar', nameInput, saveStatus, signInButton, runButton, resumeButton, stopButton)
       ),
-      h('div.af-instructions', connectionHint, h('span.af-runline', runStatus)),
+      h('div.af-instructions',
+        h('span.af-hint', 'Describe the outcome. The manager creates the roadmap, chooses the team size, and coordinates implementation, integration, and verification.'),
+        h('span.af-runline', runStatus)
+      ),
       billingHint,
       presetToolbar,
-      workspace,
+      h('section.af-manager-settings',
+        h('label.af-field', h('span', 'MANAGER / TEAM PROVIDER'), providerSelect),
+        h('label.af-field', h('span', 'SUBSCRIPTION ACCOUNT'), accountSelect),
+        h('label.af-field', h('span', 'MODEL OVERRIDE'), modelInput),
+        h('label.af-field', h('span', 'REASONING EFFORT'), reasoningSelect),
+        h('label.af-field', h('span', 'FILE PERMISSIONS'), permissionSelect),
+        h('label.af-field', h('span', 'MAX REVISION ROUNDS'), revisionInput),
+        h('div.af-capacity-card', h('span.af-settings-label', 'HOST CAPACITY'), capacityStatus)
+      ),
+      h('section.af-task-panel',
+        h('div.af-section-heading', h('div', h('span.af-section-kicker', 'REQUEST'), h('h3', 'What should the team deliver?'))),
+        taskInput
+      ),
+      h('div.af-manager-summary', managerSummary,
+        h('span.af-summary-note', 'Workers operate in isolated snapshots; overlapping edits are reported, Git metadata and symlink targets are excluded.')
+      ),
+      h('div.af-manager-content',
+        h('section.af-manager-panel.af-roadmap-panel',
+          h('div.af-section-heading',
+            h('div', h('span.af-section-kicker', 'GOALS & ACCEPTANCE'), h('h3', 'Roadmap')),
+            roadmapCount
+          ),
+          roadmapList
+        ),
+        h('section.af-manager-panel.af-workers-panel',
+          h('div.af-section-heading',
+            h('div', h('span.af-section-kicker', 'DYNAMIC TEAM'), h('h3', 'Workers')),
+            workerCount
+          ),
+          workerList
+        )
+      ),
       h('div.af-results-panel', h('div.af-results-head', h('b', 'RUN OUTPUT'), h('span', 'Worker, review, build, and orchestration results'), h('span.af-spacer')), results)
     );
     win.body.appendChild(root);
@@ -2521,11 +2900,18 @@ export default {
     async function refreshAccountState() {
       accountState = await call('agent:accounts:list');
       accountStateLoaded = true;
+      renderManagerAccountOptions();
+    }
+
+    async function refreshWorkerCapacity() {
+      workerCapacity = await call('flow:capacity');
+      syncManagerControls();
     }
 
     await refreshTools();
     await refreshCompilerTasks();
     await refreshAccountState().catch((error) => fail(error, 'SUBSCRIPTION ACCOUNTS'));
+    await refreshWorkerCapacity().catch((error) => fail(error, 'WORKER CAPACITY'));
     await loadWorkflow();
     await refreshSavedPresets().catch((error) => fail(error, 'LOAD FLOW PRESETS'));
     const offAccounts = on('agent:accounts:changed', (state) => {
@@ -2540,7 +2926,10 @@ export default {
         }
       }
       if (repaired) scheduleSave();
-      if (!busy) renderInspector();
+      if (!busy) {
+        renderInspector();
+        syncManagerControls();
+      }
     });
     const offProject = bus.on('project:changed', async () => {
       runToken++;
@@ -2548,6 +2937,7 @@ export default {
       await stopWorkflow().catch((error) => fail(error, 'SAVE FLOW CHECKPOINT'));
       busy = false;
       await refreshCompilerTasks();
+      await refreshWorkerCapacity().catch((error) => fail(error, 'WORKER CAPACITY'));
       await loadWorkflow().catch((error) => fail(error, 'LOAD AGENT FLOW'));
     });
     const offFlowFolder = bus.on('flow:add-folder', (folderPath) => {
@@ -2583,6 +2973,7 @@ export default {
       }
       task.prompt = `${task.prompt.trimEnd()}${section}`;
       renderGraph();
+      syncManagerControls();
       selectNode(task.id);
       scheduleSave();
       toast(`Added folder ${relative} to the Agent Flow task.`, 'info', 'AGENT FLOW');

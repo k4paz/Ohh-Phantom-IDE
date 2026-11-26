@@ -7,7 +7,8 @@ const path = require('path');
 
 const SERVICES = [
   'app', 'store', 'fs', 'watch', 'pty', 'sys', 'proc', 'net', 'git', 'search',
-  'http', 'db', 'ssh', 'audit', 'tasks', 'debug', 'arch', 'logs', 'collab', 'events', 'agents', 'flow'
+  'http', 'db', 'ssh', 'audit', 'tasks', 'debug', 'arch', 'logs', 'collab', 'events', 'agents', 'flow',
+  'flow-workspaces'
 ];
 
 const CHANNEL_RE = /^[a-z]+:[a-zA-Z]+(?::[a-zA-Z][a-zA-Z-]*)*$/;
