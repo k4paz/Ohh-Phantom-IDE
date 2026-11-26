@@ -22,6 +22,11 @@ function toggleFullscreen() {
   call('app:fullscreen').catch((error) => fail(error, 'HARD FULLSCREEN'));
 }
 
+function resetDesktopView() {
+  wm.setViewportTransform(1, 0, 0);
+  wm.changed('viewport');
+}
+
 // Fractional layouts (desk 1×1) — scaled to the real desktop by restoreLayout.
 export const PRESETS = {
   'Dev station': [
@@ -331,7 +336,7 @@ function buildTaskbar() {
     const list = wm.windows.filter((w) => w.ws === wm.active).sort((a, b) => a.id - b.id);
     tasks.innerHTML = '';
     for (const [index, w] of list.entries()) {
-      const shortcut = index < 9 ? ` · Ctrl+${index + 1}` : '';
+      const shortcut = index < 9 ? ` · Shift+${index + 1}` : '';
       const b = h('button.task' + (w === wm.focused ? '.focus' : '') + (w.min ? '.min' : ''), { 'data-win': w.id, title: `${w.title}${w.sub ? ' — ' + w.sub : ''}${shortcut}`, html: `${icon(w.app.icon)}<span>${esc(w.title)}${w.sub ? ' <span class="c-dim">' + esc(basename(w.sub)) + '</span>' : ''}</span>${w.pinned ? '<span class="pin">▲</span>' : ''}` });
       b.addEventListener('click', () => { if (w === wm.focused && !w.min) wm.minimize(w); else { wm.restore(w); wm.focus(w); } });
       b.addEventListener('auxclick', (e) => { if (e.button === 1) wm.close(w); });
@@ -363,9 +368,7 @@ function buildWallpaper() {
   const sig = h('div.sig');
   const hint = h('div.hint');
   const commandHints = '<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> command palette &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>`</kbd> terminal &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>O</kbd> open project &nbsp;·&nbsp; <kbd>F5</kbd> run<br>drag windows to screen edges to snap · <kbd>Alt</kbd> while dragging disables magnets';
-  const panReset = h('button.wallpaper-pan-reset', { type: 'button', title: 'Reset desktop viewport position', 'aria-label': 'Reset desktop viewport position' }, 'RESET VIEW');
-  const controls = h('div.wallpaper-controls', { role: 'group', 'aria-label': 'Desktop viewport controls' }, panReset);
-  wp.append(sig, hint, controls);
+  wp.append(sig, hint);
 
   const desktop = document.getElementById('desktop');
   let panDrag = null;
@@ -377,11 +380,6 @@ function buildWallpaper() {
     wp.style.setProperty('--wallpaper-pan-y', `${panY}px`);
   };
   bus.on('wm:viewport', drawWallpaper);
-  panReset.addEventListener('click', () => {
-    wm.setViewportTransform(1, 0, 0);
-    wm.changed('viewport');
-  });
-  controls.addEventListener('contextmenu', (event) => { event.preventDefault(); event.stopPropagation(); });
   desktop.addEventListener('pointerdown', (event) => {
     if (event.target !== desktop && event.target !== wp) return;
     if (event.button !== 1 && event.button !== 2) return;
@@ -429,7 +427,6 @@ function buildWallpaper() {
     const hasWindows = wm.windows.some((w) => w.visible);
     hint.innerHTML = `${commandHints}<br>middle/right-drag desktop to move the viewport`;
     hint.style.display = hasWindows ? 'none' : '';
-    controls.hidden = false;
   };
   bus.on('wm:changed', upd);
   bus.on('settings:changed', (key) => { if (key === 'grid') upd(); });
@@ -440,7 +437,26 @@ function buildWallpaper() {
 
 // ───────── keyboard ─────────
 function keybindings() {
-  on('app:cycleWindows', (direction) => wm.cycle(direction === -1 ? -1 : 1));
+  let lastTaskShortcut = null;
+  on('app:windowSwitcher', (action, direction) => {
+    if (action === 'step') wm.stepWindowSwitcher(direction === -1 ? -1 : 1);
+    else if (action === 'commit') wm.commitWindowSwitcher();
+    else if (action === 'cancel') wm.cancelWindowSwitcher();
+  });
+  const snapFocusedWindow = (key) => {
+    const f = wm.focused;
+    if (!f) return;
+    if (f.min) {
+      if (key === 'ArrowUp') { wm.restore(f); wm.focus(f); }
+      return;
+    }
+    const z = f.snapZone; const m = f.max;
+    if (key === 'ArrowLeft') wm.snap(f, z === 'right' ? 'center' : z === 'tl' || z === 'bl' ? z : 'left');
+    else if (key === 'ArrowRight') wm.snap(f, z === 'left' ? 'center' : z === 'tr' || z === 'br' ? z : 'right');
+    else if (key === 'ArrowUp') { if (z === 'left') wm.snap(f, 'tl'); else if (z === 'right') wm.snap(f, 'tr'); else if (z === 'bl') wm.snap(f, 'left'); else if (z === 'br') wm.snap(f, 'right'); else wm.maximize(f); }
+    else if (key === 'ArrowDown') { if (m) wm.unmaximize(f); else if (z === 'left') wm.snap(f, 'bl'); else if (z === 'right') wm.snap(f, 'br'); else if (z === 'tl') wm.snap(f, 'left'); else if (z === 'tr') wm.snap(f, 'right'); else wm.minimize(f, true, true); }
+  };
+  on('app:snapWindow', snapFocusedWindow);
   on('app:kioskError', (message) => fail(message, 'HARD FULLSCREEN'));
   document.addEventListener('keydown', (e) => {
     if (!(e.ctrlKey || e.metaKey) || e.altKey || (e.key !== 'Tab' && e.code !== 'Tab')) return;
@@ -450,17 +466,31 @@ function keybindings() {
   }, true);
   document.addEventListener('keydown', (e) => {
     const ctrl = e.ctrlKey || e.metaKey; const k = e.key;
+    const digit = Number(/^(?:Digit|Numpad)([1-9])$/.exec(e.code)?.[1] || (/^[1-9]$/.test(k) ? k : 0));
     const f = wm.focused;
     const stop = () => { e.preventDefault(); e.stopPropagation(); };
-    if (ctrl && e.shiftKey && !e.altKey && /^[1-4]$/.test(k)) { stop(); wm.switchWorkspace(Number(k) - 1); }
-    else if (ctrl && !e.altKey && !e.shiftKey && /^[1-9]$/.test(k)) {
+    if (ctrl && e.shiftKey && !e.altKey && digit >= 1 && digit <= 4) {
       stop();
-      const task = document.querySelector(`#taskbar .tasks .task:nth-child(${Number(k)})`);
+      lastTaskShortcut = null;
+      wm.switchWorkspace(digit - 1);
+    }
+    else if (!ctrl && e.shiftKey && !e.altKey && digit >= 1 && digit <= 9) {
+      stop();
+      const task = document.querySelector(`#taskbar .tasks .task:nth-child(${digit})`);
       const win = task && wm.windows.find((item) => item.id === Number(task.dataset.win));
       if (win) {
+        const now = performance.now();
+        const repeated = !e.repeat && lastTaskShortcut?.digit === digit && lastTaskShortcut.win === win
+          && now - lastTaskShortcut.at <= 800;
+        if (repeated) {
+          resetDesktopView();
+          lastTaskShortcut.at = now;
+          return;
+        }
+        lastTaskShortcut = { digit, win, at: now };
         if (win.min) wm.restore(win);
         wm.focus(win);
-      }
+      } else lastTaskShortcut = null;
     }
     else if (ctrl && e.shiftKey && !e.altKey && (k === 'D' || k === 'd')) {
       stop();
@@ -495,13 +525,9 @@ function keybindings() {
     else if (ctrl && e.altKey && /^Digit[1-4]$/.test(e.code)) { stop(); const i = Number(e.code.slice(5)) - 1; if (e.shiftKey && f) wm.moveToWorkspace(f, i); else wm.switchWorkspace(i); }
     else if (ctrl && e.altKey && (k === 't' || k === 'T')) { stop(); wm.tile(); }
     else if (ctrl && e.altKey && (k === 'd' || k === 'D')) { stop(); wm.showDesktop(); }
-    else if (ctrl && e.altKey && e.shiftKey && f && k.startsWith('Arrow')) {
+    else if (platform === 'win32' && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && f && k.startsWith('Arrow')) {
       stop();
-      const z = f.snapZone; const m = f.max;
-      if (k === 'ArrowLeft') wm.snap(f, z === 'right' ? 'center' : z === 'tl' || z === 'bl' ? z : 'left');
-      else if (k === 'ArrowRight') wm.snap(f, z === 'left' ? 'center' : z === 'tr' || z === 'br' ? z : 'right');
-      else if (k === 'ArrowUp') { if (z === 'left') wm.snap(f, 'tl'); else if (z === 'right') wm.snap(f, 'tr'); else if (z === 'bl') wm.snap(f, 'left'); else if (z === 'br') wm.snap(f, 'right'); else wm.maximize(f); }
-      else if (k === 'ArrowDown') { if (m) wm.unmaximize(f); else if (z === 'left') wm.snap(f, 'bl'); else if (z === 'right') wm.snap(f, 'br'); else if (z === 'tl') wm.snap(f, 'left'); else if (z === 'tr') wm.snap(f, 'right'); else wm.minimize(f); }
+      snapFocusedWindow(k);
     }
   }, true);
 }

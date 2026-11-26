@@ -199,13 +199,33 @@ const assert = (c, m) => { if (!c) throw new Error('assert: ' + m); };
     throw new Error('unsupported web search mode accepted');
   });
   await t('orchestrator accepts tagged and JSON-formatted actions', async () => {
-    const { FLOW_ACTION_TAG, parseFlowAction } = await import('../renderer/js/core/flow-protocol.mjs');
+    const { FLOW_ACTION_TAG, parseFlowAction, validateRoadmapPlan, validateGoalEvidence } = await import('../renderer/js/core/flow-protocol.mjs');
     const tagged = parseFlowAction(`Plan\n<${FLOW_ACTION_TAG}>{"action":"delegate","summary":"Split work"}</${FLOW_ACTION_TAG}>`);
     const fenced = parseFlowAction('```json\n{"action":"complete","finalResponse":"Done"}\n```');
     const plain = parseFlowAction('{"action":"ask_user","question":"Which target?"}');
     assert(tagged.action.action === 'delegate' && tagged.visibleText === 'Plan', 'tagged action and visible summary');
     assert(fenced.action.action === 'complete', 'JSON code fence fallback');
     assert(plain.action.action === 'ask_user', 'plain JSON fallback');
+    const plan = validateRoadmapPlan({
+      summary: 'Implement the feature',
+      goals: [{ id: 'feature', title: 'Deliver the feature', acceptanceCriteria: ['The feature works'] }],
+      assignments: [{ workerId: 'worker-1', task: 'Implement the feature', goalIds: ['feature'] }]
+    });
+    assert(plan.assignments.length === 1, 'accept a scoped worker assignment');
+    assert(validateGoalEvidence([{ goalId: 'feature', evidence: 'Tested successfully' }], plan.goals).length === 1, 'require evidence for each goal');
+    for (const invalid of [
+      { goals: [], assignments: [{ workerId: 'worker-1', task: 'work', goalIds: [] }] },
+      { goals: [{ id: 'goal', title: 'Goal', acceptanceCriteria: ['criterion'] }], assignments: [] },
+      { goals: [{ id: 'goal', title: 'Goal', acceptanceCriteria: ['criterion'] }], assignments: [{ workerId: 'worker-1', task: 'work', goalIds: [] }] }
+    ]) {
+      try { validateRoadmapPlan(invalid); }
+      catch { continue; }
+      throw new Error('incomplete roadmap accepted');
+    }
+    let evidenceRejected = false;
+    try { validateGoalEvidence([], plan.goals); }
+    catch { evidenceRejected = true; }
+    assert(evidenceRejected, 'block completion without goal evidence');
     try { parseFlowAction('No structured action here.'); }
     catch (error) { return error.message; }
     throw new Error('unstructured response accepted');
@@ -238,6 +258,76 @@ const assert = (c, m) => { if (!c) throw new Error('assert: ' + m); };
     try { await call('flow:save', proj, { nodes: 'not-an-array', edges: [] }); }
     catch (error) { return error.message; }
     throw new Error('invalid workflow accepted');
+  });
+  await t('Agent Flow reports host-based worker capacity', async () => {
+    const capacity = await call('flow:capacity');
+    assert(Number.isInteger(capacity.logicalCpus) && capacity.logicalCpus > 0, 'report logical CPU capacity');
+    assert(Number.isInteger(capacity.maxConcurrentAgents) && capacity.maxConcurrentAgents > 0, 'report a positive worker concurrency');
+    assert(capacity.maxConcurrentAgents <= capacity.logicalCpus, 'do not exceed logical CPU capacity');
+    return `${capacity.maxConcurrentAgents} concurrent agents across ${capacity.logicalCpus} logical CPUs`;
+  });
+  await t('Agent Flow snapshots existing project changes and integrates worker edits', async () => {
+    const projectFile = path.join(proj, 'src', 'a.js');
+    const originalContent = fs.readFileSync(projectFile, 'utf8');
+    fs.mkdirSync(path.join(proj, '.git'));
+    fs.writeFileSync(path.join(proj, '.git', 'private-marker'), 'not copied');
+    const snapshot = await call('flow:workspace:create', proj);
+    try {
+      const workerFile = path.join(snapshot.root, 'src', 'a.js');
+      assert(fs.readFileSync(workerFile, 'utf8') === fs.readFileSync(path.join(proj, 'src', 'a.js'), 'utf8'), 'snapshot includes current project content');
+      assert(!fs.existsSync(path.join(snapshot.root, '.git')), 'snapshot excludes Git internals');
+      assert(!fs.existsSync(path.join(snapshot.root, '.phantom', 'agent-flow.json')), 'snapshot excludes its own workflow configuration');
+      fs.writeFileSync(workerFile, 'worker implementation\n');
+      fs.writeFileSync(path.join(snapshot.root, 'src', 'worker-new.js'), 'new worker file\n');
+      const integrated = await call('flow:workspace:integrate', proj, snapshot.id);
+      assert(integrated.conflicts.length === 0 && integrated.applied.length === 2, 'integrate non-overlapping worker changes');
+      assert(fs.readFileSync(path.join(proj, 'src', 'a.js'), 'utf8') === 'worker implementation\n', 'apply worker modification');
+      assert(fs.readFileSync(path.join(proj, 'src', 'worker-new.js'), 'utf8') === 'new worker file\n', 'apply worker addition');
+      return 'dirty project content copied; worker modification and addition integrated';
+    } finally {
+      await call('flow:workspace:dispose', snapshot.id);
+      fs.writeFileSync(projectFile, originalContent);
+      fs.rmSync(path.join(proj, 'src', 'worker-new.js'), { force: true });
+      fs.rmSync(path.join(proj, '.git'), { recursive: true, force: true });
+    }
+  });
+  await t('Agent Flow refuses overlapping worker edits without overwriting the project', async () => {
+    const projectFile = path.join(proj, 'src', 'a.js');
+    const originalContent = fs.readFileSync(projectFile, 'utf8');
+    const snapshot = await call('flow:workspace:create', proj);
+    try {
+      const file = path.join(snapshot.root, 'src', 'a.js');
+      fs.writeFileSync(file, 'worker version\n');
+      fs.writeFileSync(path.join(proj, 'src', 'a.js'), 'user version\n');
+      fs.writeFileSync(path.join(proj, 'src', 'unrelated.js'), 'unrelated user edit\n');
+      const result = await call('flow:workspace:integrate', proj, snapshot.id);
+      assert(result.conflicts.includes(path.join('src', 'a.js')), 'report overlapping path');
+      assert(fs.readFileSync(path.join(proj, 'src', 'a.js'), 'utf8') === 'user version\n', 'preserve concurrent user change');
+      assert(fs.readFileSync(path.join(proj, 'src', 'unrelated.js'), 'utf8') === 'unrelated user edit\n', 'preserve unrelated concurrent edit');
+      return 'overlap reported and active project file preserved';
+    } finally {
+      await call('flow:workspace:dispose', snapshot.id);
+      fs.writeFileSync(projectFile, originalContent);
+      fs.rmSync(path.join(proj, 'src', 'unrelated.js'), { force: true });
+    }
+  });
+  await t('Agent Flow clones every concurrent worker from one immutable snapshot', async () => {
+    const projectFile = path.join(proj, 'src', 'a.js');
+    const originalContent = fs.readFileSync(projectFile, 'utf8');
+    const base = await call('flow:workspace:create', proj);
+    let clone;
+    try {
+      fs.writeFileSync(projectFile, 'concurrent user edit after capture\n');
+      clone = await call('flow:workspace:clone', base.id);
+      assert(fs.readFileSync(path.join(clone.root, 'src', 'a.js'), 'utf8') === originalContent, 'clone inherits the captured baseline, not a later project edit');
+      fs.writeFileSync(path.join(base.root, 'src', 'a.js'), 'first worker edit\n');
+      assert(fs.readFileSync(path.join(clone.root, 'src', 'a.js'), 'utf8') === originalContent, 'worker snapshots are independent');
+      return 'parallel workspaces share a baseline but not writable files';
+    } finally {
+      if (clone) await call('flow:workspace:dispose', clone.id);
+      await call('flow:workspace:dispose', base.id);
+      fs.writeFileSync(projectFile, originalContent);
+    }
   });
   await t('store set/get', async () => { await call('store:set', 'layouts', { a: 1 }); const v = await call('store:get', 'layouts'); assert(v.a === 1, 'v'); return JSON.stringify(v); });
   await t('store rejects bad key', async () => { try { await call('store:set', '../x', 1); } catch (e) { return e.message; } throw new Error('accepted'); });

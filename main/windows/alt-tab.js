@@ -10,7 +10,7 @@ function hookScriptPath() {
     : scriptPath;
 }
 
-function createAltTabHook({ onCycle, onExit, onFailure }) {
+function createAltTabHook({ onSwitcher, onSnap, onExit, onFailure }) {
   let active = null;
 
   function stop() {
@@ -68,8 +68,14 @@ function createAltTabHook({ onCycle, onExit, onFailure }) {
         resolveReady();
         return;
       }
-      if (line === 'CYCLE_FORWARD') onCycle(1);
-      else if (line === 'CYCLE_REVERSE') onCycle(-1);
+      if (line === 'SWITCHER_STEP_FORWARD') onSwitcher('step', 1);
+      else if (line === 'SWITCHER_STEP_REVERSE') onSwitcher('step', -1);
+      else if (line === 'SWITCHER_COMMIT') onSwitcher('commit');
+      else if (line === 'SWITCHER_CANCEL') onSwitcher('cancel');
+      else if (line === 'SNAP_LEFT') onSnap('ArrowLeft');
+      else if (line === 'SNAP_RIGHT') onSnap('ArrowRight');
+      else if (line === 'SNAP_UP') onSnap('ArrowUp');
+      else if (line === 'SNAP_DOWN') onSnap('ArrowDown');
       else if (line === 'EXIT') onExit();
     };
 
