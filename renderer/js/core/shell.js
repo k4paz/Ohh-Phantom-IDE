@@ -378,6 +378,10 @@ function buildWallpaper() {
   const desktop = document.getElementById('desktop');
   let panDrag = null;
   let suppressContextMenu = false;
+  desktop.addEventListener('dblclick', (event) => {
+    if (event.target !== desktop && event.target !== wp) return;
+    wm.unfocus();
+  });
   const drawWallpaper = () => {
     const { panX, panY } = wm.viewport;
     wp.style.setProperty('--wallpaper-grid-size', '32px');

@@ -241,7 +241,14 @@ export class WindowManager {
     let cands = this.history.filter((w) => w.visible);
     if (!cands.length) cands = this.windows.filter((w) => w.visible).sort((a, b) => (a.pinned - b.pinned) || a.z - b.z);
     const top = cands[cands.length - 1];
-    if (top) this.focus(top); else if (this.focused) { this.focused.el.classList.remove('focus'); this.focused = null; this.changed('focus', true); }
+    if (top) this.focus(top); else this.unfocus();
+  }
+  unfocus() {
+    if (!this.focused) return;
+    this.focused.el.classList.remove('focus');
+    this.focused = null;
+    this.cycleOrder = null;
+    this.changed('focus', true);
   }
   /** Most recently focused window of an app (current workspace preferred). */
   recent(appId) {
