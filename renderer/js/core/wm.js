@@ -69,6 +69,7 @@ export class WindowManager {
     this.cycleOrder = null;
     this.cycling = false;
     this.windowSwitcher = null;
+    this.overviewState = null;
     bus.on('wm:changed', () => this.refreshWindowSwitcher());
   }
 
@@ -103,14 +104,65 @@ export class WindowManager {
       y: (clientY - deskRect.top - panY) / zoom
     };
   }
-  setViewportTransform(_zoom, panX, panY) {
-    this.viewport = { zoom: 1, panX, panY };
-    this.world.style.transform = `translate(${panX}px, ${panY}px)`;
+  setViewportTransform(zoom, panX, panY) {
+    const scale = Math.min(1, Math.max(0.05, zoom));
+    this.viewport = { zoom: scale, panX, panY };
+    this.world.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
     for (const win of this.windows) {
       if (win.max) this.render(win);
       else if (win.snapZone) { win.rect = this.zoneRect(win.snapZone); this.render(win); }
     }
     bus.emit('wm:viewport', this.viewport);
+  }
+  toggleOverview() {
+    if (this.overviewState) return this.exitOverview();
+    const windows = this.windows.filter((win) => win.visible);
+    if (!windows.length) return;
+
+    const windowStates = new Map(windows.map((win) => [win, {
+      rect: { ...win.rect },
+      max: win.max,
+      snapZone: win.snapZone,
+      restoreRect: win.restoreRect && { ...win.restoreRect }
+    }]));
+    this.overviewState = { viewport: { ...this.viewport }, windows: windowStates };
+    for (const win of windows) {
+      const state = windowStates.get(win);
+      if (state.snapZone && state.restoreRect) win.rect = { ...state.restoreRect };
+      win.max = false;
+      win.snapZone = null;
+      this.render(win);
+      this.sync(win);
+    }
+
+    const bounds = windows.map((win) => win.rect);
+    const left = Math.min(...bounds.map((rect) => rect.x));
+    const top = Math.min(...bounds.map((rect) => rect.y));
+    const right = Math.max(...bounds.map((rect) => rect.x + rect.w));
+    const bottom = Math.max(...bounds.map((rect) => rect.y + rect.h));
+    const width = Math.max(1, right - left);
+    const height = Math.max(1, bottom - top);
+    const zoom = Math.max(0.05, Math.min(1, (this.W - 48) / width, (this.H - 48) / height));
+    const panX = (this.W - width * zoom) / 2 - left * zoom;
+    const panY = (this.H - height * zoom) / 2 - top * zoom;
+    this.setViewportTransform(zoom, panX, panY);
+    this.changed('overview');
+  }
+  exitOverview() {
+    if (!this.overviewState) return;
+    const overview = this.overviewState;
+    this.overviewState = null;
+    this.setViewportTransform(overview.viewport.zoom, overview.viewport.panX, overview.viewport.panY);
+    for (const [win, state] of overview.windows) {
+      if (win.closed) continue;
+      win.max = state.max;
+      win.snapZone = state.snapZone;
+      win.restoreRect = state.restoreRect && { ...state.restoreRect };
+      if (state.snapZone) win.rect = this.zoneRect(state.snapZone);
+      this.render(win);
+      this.sync(win);
+    }
+    this.changed('overview');
   }
 
   // ───────── lifecycle ─────────
@@ -326,6 +378,7 @@ export class WindowManager {
   // ───────── workspaces ─────────
   switchWorkspace(i) {
     if (i === this.active || i < 0 || i >= WORKSPACES) return;
+    this.exitOverview();
     this.active = i;
     for (const w of this.windows) this.sync(w);
     this.focusTop();
@@ -732,17 +785,27 @@ export class WindowManager {
 
   // ───────── persistence ─────────
   serialize() {
+    const viewport = this.overviewState?.viewport || this.viewport;
     return {
-      v: 1, active: this.active, desk: { w: this.W, h: this.H }, viewport: { ...this.viewport },
+      v: 1, active: this.active, desk: { w: this.W, h: this.H }, viewport: { ...viewport },
       windows: [...this.windows].sort((a, b) => a.z - b.z).map((w) => {
         let state = {};
         try { state = w.instance && w.instance.serialize ? w.instance.serialize() : {}; } catch (e) { console.error(e); }
-        return { app: w.app.id, ws: w.ws, rect: w.rect, restoreRect: w.restoreRect, min: w.min, max: w.max, pinned: w.pinned, snap: w.snapZone, title: w.title !== w.app.title ? w.title : undefined, state, focused: w === this.focused };
+        const overview = this.overviewState?.windows.get(w);
+        const rect = overview && (overview.max || overview.snapZone) ? overview.rect : w.rect;
+        return {
+          app: w.app.id, ws: w.ws, rect,
+          restoreRect: overview ? overview.restoreRect : w.restoreRect,
+          min: w.min, max: overview ? overview.max : w.max, pinned: w.pinned,
+          snap: overview ? overview.snapZone : w.snapZone,
+          title: w.title !== w.app.title ? w.title : undefined, state, focused: w === this.focused
+        };
       })
     };
   }
   async restoreLayout(layout, { replace = true } = {}) {
     if (!layout || !Array.isArray(layout.windows)) return;
+    this.exitOverview();
     if (replace && !(await this.closeAll())) return;
     const sx = layout.desk && layout.desk.w ? this.W / layout.desk.w : 1;
     const sy = layout.desk && layout.desk.h ? this.H / layout.desk.h : 1;

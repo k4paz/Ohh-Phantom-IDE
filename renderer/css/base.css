@@ -97,20 +97,18 @@ button, input, select, textarea { font: inherit; color: inherit; }
 #wallpaper { position: absolute; inset: 0; pointer-events: none; }
 body.grid-on #wallpaper {
   background-image:
-    radial-gradient(ellipse at 50% 40%, rgba(var(--accent-rgb), .045), transparent 65%),
+    radial-gradient(ellipse at center, transparent 35%, rgba(0, 0, 0, .32) 100%),
     linear-gradient(rgba(var(--accent-rgb), .035) 1px, transparent 1px),
     linear-gradient(90deg, rgba(var(--accent-rgb), .035) 1px, transparent 1px);
   background-size: 100% 100%, var(--wallpaper-grid-size, 32px) var(--wallpaper-grid-size, 32px), var(--wallpaper-grid-size, 32px) var(--wallpaper-grid-size, 32px);
   background-position:
-    calc(50% + var(--wallpaper-pan-x, 0px)) calc(50% + var(--wallpaper-pan-y, 0px)),
+    center,
     var(--wallpaper-pan-x, 0px) var(--wallpaper-pan-y, 0px),
     var(--wallpaper-pan-x, 0px) var(--wallpaper-pan-y, 0px);
 }
 #desktop.wallpaper-panning { cursor: grabbing; user-select: none; }
 #wallpaper .sig { position: absolute; right: 22px; bottom: 16px; text-align: right; color: var(--mute); font-size: var(--fs-xs); line-height: 1.6; letter-spacing: .1em; }
 #wallpaper .sig b { display: block; color: rgba(var(--accent-rgb), .22); font-size: 34px; letter-spacing: .5em; font-weight: 800; margin-bottom: 4px; }
-#wallpaper .hint { position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%); color: var(--mute); text-align: center; line-height: 2; }
-#wallpaper .hint kbd { border: 1px solid var(--line2); padding: 0 5px; color: var(--dim); }
 #fx-scanlines { pointer-events: none; position: fixed; inset: 0; z-index: 99999; display: none; background: repeating-linear-gradient(to bottom, rgba(0,0,0,0) 0, rgba(0,0,0,0) 2px, rgba(0,0,0,.16) 3px); mix-blend-mode: multiply; }
 body.scanlines #fx-scanlines { display: block; }
 body.scanlines #fx-scanlines::after { content: ""; position: absolute; inset: 0; background: radial-gradient(ellipse at center, transparent 60%, rgba(0,0,0,.35)); }

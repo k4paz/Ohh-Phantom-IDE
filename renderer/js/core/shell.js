@@ -23,6 +23,7 @@ function toggleFullscreen() {
 }
 
 function resetDesktopView() {
+  wm.exitOverview();
   wm.setViewportTransform(1, 0, 0);
   wm.changed('viewport');
 }
@@ -129,6 +130,7 @@ export function commands() {
       { group: 'live', label: live.session.role === 'host' ? 'Live: End session' : 'Live: Leave session', icon: 'close', run: () => live.leave() }] : []),
     { group: 'window', label: 'Tile windows', icon: 'layout', key: 'Ctrl+Alt+T', run: () => wm.tile() },
     { group: 'window', label: 'Cascade windows', icon: 'layout', run: () => wm.cascade() },
+    { group: 'window', label: 'Toggle app overview', icon: 'layout', key: 'Ctrl+Tab', run: () => wm.toggleOverview() },
     { group: 'window', label: 'Show desktop', icon: 'layout', key: 'Ctrl+Alt+D', run: () => wm.showDesktop() },
     { group: 'window', label: 'Duplicate focused window', icon: 'layout', key: 'Ctrl+Shift+D', run: () => wm.focused && wm.duplicate(wm.focused) },
     { group: 'window', label: 'Close all other windows', icon: 'close', key: 'Ctrl+Shift+R', run: () => wm.focused && wm.closeOthers(wm.focused) },
@@ -223,6 +225,7 @@ function buildTopbar() {
     WINDOW: () => [
       { label: 'Tile', key: 'Ctrl+Alt+T', action: () => wm.tile() },
       { label: 'Cascade', action: () => wm.cascade() },
+      { label: 'Toggle app overview', key: 'Ctrl+Tab', action: () => wm.toggleOverview() },
       { label: 'Show desktop', key: 'Ctrl+Alt+D', action: () => wm.showDesktop() },
       ...[['ArrowLeft', '←'], ['ArrowRight', '→'], ['ArrowUp', '↑'], ['ArrowDown', '↓']].map(([keyName, hint]) => ({
         label: `Snap focused window ${keyName.slice(5).toLowerCase()}`,
@@ -393,8 +396,8 @@ function buildWallpaper() {
     wm.unfocus();
   });
   const drawWallpaper = () => {
-    const { panX, panY } = wm.viewport;
-    wp.style.setProperty('--wallpaper-grid-size', '32px');
+    const { zoom, panX, panY } = wm.viewport;
+    wp.style.setProperty('--wallpaper-grid-size', `${32 * zoom}px`);
     wp.style.setProperty('--wallpaper-pan-x', `${panX}px`);
     wp.style.setProperty('--wallpaper-pan-y', `${panY}px`);
   };
@@ -466,7 +469,11 @@ function keybindings() {
     const digit = Number(/^(?:Digit|Numpad)([1-9])$/.exec(e.code)?.[1] || (/^[1-9]$/.test(k) ? k : 0));
     const f = wm.focused;
     const stop = () => { e.preventDefault(); e.stopPropagation(); };
-    if (ctrl && e.shiftKey && !e.altKey && digit >= 1 && digit <= 4) {
+    if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && (k === 'Tab' || e.code === 'Tab')) {
+      stop();
+      if (!e.repeat) wm.toggleOverview();
+    }
+    else if (ctrl && e.shiftKey && !e.altKey && digit >= 1 && digit <= 4) {
       stop();
       lastTaskShortcut = null;
       wm.switchWorkspace(digit - 1);
