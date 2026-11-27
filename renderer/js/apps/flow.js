@@ -1,4 +1,4 @@
-import { h, sep } from '../core/dom.js';
+import { h, join, sep } from '../core/dom.js';
 import { call, on, bus } from '../core/api.js';
 import { project } from '../core/project.js';
 import { renderMarkdown } from '../core/markdown.js';
@@ -352,6 +352,17 @@ export default {
       });
       checkpointWrite = write;
       return write;
+    }
+
+    async function disposeRunWorkspaces(checkpoint = runCheckpoint) {
+      if (!checkpoint) return;
+      const ids = new Set([
+        ...(Array.isArray(checkpoint.workspaceIds) ? checkpoint.workspaceIds : []),
+        ...Object.values(checkpoint.workspaceByWorker || {}).map((workspace) => workspace?.id)
+      ].filter((id) => typeof id === 'string'));
+      for (const id of ids) await call('flow:workspace:dispose', id);
+      checkpoint.workspaceIds = [];
+      checkpoint.workspaceByWorker = {};
     }
 
     async function setCheckpointPhase(phase, progress, token) {
@@ -2046,10 +2057,16 @@ export default {
             await saveRunCheckpoint();
           }
         }
-        const workspaces = batch.map(({ worker }) => ({
-          worker,
-          ...(newWorkspaces.get(worker.id) || runCheckpoint.workspaceByWorker[worker.id])
-        }));
+        const workspaces = batch.map(({ worker }) => {
+          const previousConflicts = Object.entries(runCheckpoint.unresolvedConflictOwners)
+            .filter(([, owners]) => Array.isArray(owners) && owners.includes(worker.id))
+            .map(([file]) => file);
+          return {
+            worker,
+            ...(newWorkspaces.get(worker.id) || runCheckpoint.workspaceByWorker[worker.id]),
+            previousConflicts
+          };
+        });
         if (workspaces.some((workspace) => !workspace.id || !workspace.root)) {
           throw new Error('A saved Agent Flow worker workspace is invalid. Resume the assignment to create a fresh snapshot.');
         }
@@ -2059,6 +2076,20 @@ export default {
             assertRunCurrent(token);
             setNodeStatus(worker.id, 'STARTING', 'running');
             const upstream = reachableInputText(worker, values);
+            const workspace = workspaces[index];
+            let conflictContext = '';
+            if (workspace.previousConflicts.length) {
+              const rebased = await call('flow:workspace:rebase', project.root, workspace.id, workspace.previousConflicts);
+              const copies = rebased.paths.map((entry) =>
+                `${entry.path}: original=${join(workspace.root, entry.path)}, prior worker version=${join(workspace.root, entry.workerVersion)}, current project version=${join(workspace.root, entry.projectVersion)} (${entry.projectType})`
+              );
+              conflictContext = [
+                'Resolve the existing integration conflicts by merging the saved worker proposal with the current project version.',
+                `Rebased conflict directory: ${join(workspace.root, rebased.conflictDirectory)}`,
+                'The original workspace paths now contain the current project versions. The prior worker and current project copies are preserved under the conflict directory; edit the original paths after reconciling them.',
+                ...copies
+              ].join('\n');
+            }
             const prompt = [
               `You are "${worker.label}", a coworker in the PHANTOM manager-led project "${workflow.name}".`,
               `Your scoped assignment:\n${task}`,
@@ -2067,6 +2098,7 @@ export default {
               `Agent mode:\n${modeInstruction(worker)}`,
               `Original user task:\n${plan.input.prompt.trim()}`,
               clarifications.length ? `User clarifications:\n${formatClarifications(clarifications)}` : '',
+              conflictContext ? `Existing integration conflicts to resolve:\n${conflictContext}` : '',
               context ? `Review, integration, and compiler feedback to address:\n${context}` : '',
               upstream ? `Connected upstream results:\n${upstream}` : '',
               runCheckpoint.resumeMode ? 'This is a resumed assignment. Inspect the current project snapshot first and continue idempotently.' : '',
@@ -2087,13 +2119,11 @@ export default {
             continue;
           }
           const { worker, result } = settled.value;
+          const workerWorkspace = workspaces[index];
           values.set(worker.id, result.text);
           runCheckpoint.values = [...values.entries()];
           setNodeStatus(worker.id, 'INTEGRATING', 'running');
-          const previousConflicts = Object.entries(runCheckpoint.unresolvedConflictOwners)
-            .filter(([, owners]) => Array.isArray(owners) && owners.includes(worker.id))
-            .map(([file]) => file);
-          const integrated = await call('flow:workspace:integrate', project.root, workspace.id, previousConflicts);
+          const integrated = await call('flow:workspace:integrate', project.root, workspace.id, workerWorkspace.previousConflicts);
           const conflicts = Array.isArray(integrated.conflicts) ? integrated.conflicts : [];
           const report = {
             workerId: worker.id,
@@ -2104,10 +2134,7 @@ export default {
           };
           runCheckpoint.integrationReports.push(report);
           for (const file of [...report.applied, ...report.resolved]) {
-            const owners = runCheckpoint.unresolvedConflictOwners[file] || [];
-            const remaining = owners.filter((owner) => owner !== worker.id);
-            if (remaining.length) runCheckpoint.unresolvedConflictOwners[file] = remaining;
-            else delete runCheckpoint.unresolvedConflictOwners[file];
+            delete runCheckpoint.unresolvedConflictOwners[file];
           }
           for (const file of conflicts) {
             const owners = runCheckpoint.unresolvedConflictOwners[file] || [];
@@ -2269,6 +2296,7 @@ export default {
       updateControls();
       try {
         if (!resume) {
+          await disposeRunWorkspaces();
           await clearRunCheckpoint();
           assertRunCurrent(token);
           runCheckpoint = {
@@ -2659,6 +2687,7 @@ export default {
         runCheckpoint.status = blocked ? 'blocked' : 'complete';
         runCheckpoint.progress = blocked ? 'Blocked · completion gates remain' : 'Workflow completed';
         runCheckpoint.activeNodeId = '';
+        await disposeRunWorkspaces();
         await saveRunCheckpoint();
         assertRunCurrent(token);
         runStatus.textContent = blocked ? 'BLOCKED · INCOMPLETE' : 'COMPLETE';

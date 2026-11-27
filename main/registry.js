@@ -29,10 +29,21 @@ function createCore({ dataDir, emit, platformHooks = {} }) {
       if (fileWriteQueues.get(key) === current) fileWriteQueues.delete(key);
     });
   };
+  const withFileLocks = (files, action) => {
+    const locks = [...new Set(files.map((file) => {
+      const resolved = path.resolve(file);
+      return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+    }))].sort();
+    const acquire = (index) => index === locks.length
+      ? action()
+      : withFileLock(locks[index], () => acquire(index + 1));
+    return acquire(0);
+  };
 
   const core = {
     dataDir,
     withFileLock,
+    withFileLocks,
     bus,
     hooks: platformHooks, // electron-only capabilities: dialog, trash, reveal, window controls
     emit(channel, payload) {

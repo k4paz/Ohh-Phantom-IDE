@@ -65,32 +65,44 @@ module.exports = (core) => ({
 
   'fs:exists': async (p) => { try { await fsp.access(abs(p)); return true; } catch { return false; } },
 
-  'fs:mkdir': async (p) => { p = abs(p); await fsp.mkdir(p, { recursive: true }); return p; },
+  'fs:mkdir': async (p) => {
+    p = abs(p);
+    return core.withFileLock(p, async () => { await fsp.mkdir(p, { recursive: true }); return p; });
+  },
 
   'fs:createFile': async (p, content = '') => {
     p = abs(p);
-    await fsp.mkdir(path.dirname(p), { recursive: true });
-    await fsp.writeFile(p, String(content), { flag: 'wx' });
-    return p;
+    return core.withFileLock(p, async () => {
+      await fsp.mkdir(path.dirname(p), { recursive: true });
+      await fsp.writeFile(p, String(content), { flag: 'wx' });
+      return p;
+    });
   },
 
   'fs:rename': async (from, to) => {
     from = abs(from); to = abs(to);
-    try { await fsp.access(to); throw new Error('Target already exists'); } catch (e) { if (e.message === 'Target already exists') throw e; }
-    await fsp.rename(from, to);
-    return to;
+    return core.withFileLocks([from, to], async () => {
+      try { await fsp.lstat(to); throw new Error('Target already exists'); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      await fsp.rename(from, to);
+      return to;
+    });
   },
 
   'fs:copy': async (from, to) => {
     from = abs(from); to = abs(to);
-    await fsp.cp(from, to, { recursive: true, errorOnExist: true, force: false });
-    return to;
+    return core.withFileLocks([from, to], async () => {
+      await fsp.cp(from, to, { recursive: true, errorOnExist: true, force: false });
+      return to;
+    });
   },
 
   'fs:trash': async (p) => {
     p = abs(p);
     if (p === path.parse(p).root || p === os.homedir()) throw new Error('Refusing to trash this location');
-    if (core.hooks.trash) { await core.hooks.trash(p); return true; }
+    if (core.hooks.trash) {
+      return core.withFileLock(p, async () => { await core.hooks.trash(p); return true; });
+    }
     throw new Error('System trash unavailable in this runtime');
   },
 

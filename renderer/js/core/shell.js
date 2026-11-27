@@ -27,6 +27,20 @@ function resetDesktopView() {
   wm.changed('viewport');
 }
 
+function snapFocusedWindow(key) {
+  const f = wm.focused;
+  if (!f) return;
+  if (f.min) {
+    if (key === 'ArrowUp') { wm.restore(f); wm.focus(f); }
+    return;
+  }
+  const z = f.snapZone; const m = f.max;
+  if (key === 'ArrowLeft') wm.snap(f, z === 'right' ? 'center' : z === 'tl' || z === 'bl' ? z : 'left');
+  else if (key === 'ArrowRight') wm.snap(f, z === 'left' ? 'center' : z === 'tr' || z === 'br' ? z : 'right');
+  else if (key === 'ArrowUp') { if (z === 'left') wm.snap(f, 'tl'); else if (z === 'right') wm.snap(f, 'tr'); else if (z === 'bl') wm.snap(f, 'left'); else if (z === 'br') wm.snap(f, 'right'); else wm.maximize(f); }
+  else if (key === 'ArrowDown') { if (m) wm.unmaximize(f); else if (z === 'left') wm.snap(f, 'bl'); else if (z === 'right') wm.snap(f, 'br'); else if (z === 'tl') wm.snap(f, 'left'); else if (z === 'tr') wm.snap(f, 'right'); else wm.minimize(f, true, true); }
+}
+
 // Fractional layouts (desk 1×1) — scaled to the real desktop by restoreLayout.
 export const PRESETS = {
   'Dev station': [
@@ -369,9 +383,7 @@ function buildTaskbar() {
 function buildWallpaper() {
   const wp = document.getElementById('wallpaper');
   const sig = h('div.sig');
-  const hint = h('div.hint');
-  const commandHints = '<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> command palette &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>`</kbd> terminal &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>O</kbd> open project &nbsp;·&nbsp; <kbd>F5</kbd> run<br>drag windows to screen edges to snap · <kbd>Alt</kbd> while dragging disables magnets';
-  wp.append(sig, hint);
+  wp.append(sig);
 
   const desktop = document.getElementById('desktop');
   let panDrag = null;
@@ -431,9 +443,6 @@ function buildWallpaper() {
   const upd = () => {
     const s = telemetry.static;
     sig.innerHTML = `<b>PHANTOM</b>${s ? `${esc(s.user)}@${esc(s.hostname)} · ${esc(s.distro)} · ${esc(s.cpuModel)} × ${s.cores}` : ''}`;
-    const hasWindows = wm.windows.some((w) => w.visible);
-    hint.innerHTML = `${commandHints}<br>middle/right-drag desktop to move the viewport`;
-    hint.style.display = hasWindows ? 'none' : '';
   };
   bus.on('wm:changed', upd);
   bus.on('settings:changed', (key) => { if (key === 'grid') upd(); });
@@ -450,19 +459,6 @@ function keybindings() {
     else if (action === 'commit') wm.commitWindowSwitcher();
     else if (action === 'cancel') wm.cancelWindowSwitcher();
   });
-  const snapFocusedWindow = (key) => {
-    const f = wm.focused;
-    if (!f) return;
-    if (f.min) {
-      if (key === 'ArrowUp') { wm.restore(f); wm.focus(f); }
-      return;
-    }
-    const z = f.snapZone; const m = f.max;
-    if (key === 'ArrowLeft') wm.snap(f, z === 'right' ? 'center' : z === 'tl' || z === 'bl' ? z : 'left');
-    else if (key === 'ArrowRight') wm.snap(f, z === 'left' ? 'center' : z === 'tr' || z === 'br' ? z : 'right');
-    else if (key === 'ArrowUp') { if (z === 'left') wm.snap(f, 'tl'); else if (z === 'right') wm.snap(f, 'tr'); else if (z === 'bl') wm.snap(f, 'left'); else if (z === 'br') wm.snap(f, 'right'); else wm.maximize(f); }
-    else if (key === 'ArrowDown') { if (m) wm.unmaximize(f); else if (z === 'left') wm.snap(f, 'bl'); else if (z === 'right') wm.snap(f, 'br'); else if (z === 'tl') wm.snap(f, 'left'); else if (z === 'tr') wm.snap(f, 'right'); else wm.minimize(f, true, true); }
-  };
   on('app:snapWindow', snapFocusedWindow);
   on('app:kioskError', (message) => fail(message, 'HARD FULLSCREEN'));
   document.addEventListener('keydown', (e) => {

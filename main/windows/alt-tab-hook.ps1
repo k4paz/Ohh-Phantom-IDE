@@ -34,6 +34,7 @@ public static class PhantomAltTabHook
     private const uint LLKHF_ALTDOWN = 0x20;
     private static readonly LowLevelKeyboardProc Callback = HookCallback;
     private static IntPtr hook;
+    private static int parentProcessId;
     private static bool suppressTabUp;
     private static bool suppressF12Up;
     private static bool suppressEscapeUp;
@@ -85,6 +86,12 @@ public static class PhantomAltTabHook
     private static extern bool PeekMessage(out Message message, IntPtr window, uint min, uint max, uint remove);
 
     [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("user32.dll")]
     private static extern short GetAsyncKeyState(int virtualKey);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -107,6 +114,15 @@ public static class PhantomAltTabHook
     private static bool IsAltKey(int virtualKey)
     {
         return virtualKey == VK_MENU || virtualKey == VK_LMENU || virtualKey == VK_RMENU;
+    }
+
+    private static bool IsParentForeground()
+    {
+        IntPtr foreground = GetForegroundWindow();
+        if (foreground == IntPtr.Zero) return false;
+        uint foregroundProcessId;
+        GetWindowThreadProcessId(foreground, out foregroundProcessId);
+        return foregroundProcessId == (uint)parentProcessId;
     }
 
     private static void Emit(string message)
@@ -132,11 +148,26 @@ public static class PhantomAltTabHook
             KeyboardData data = (KeyboardData)Marshal.PtrToStructure(lParam, typeof(KeyboardData));
             int key = unchecked((int)data.virtualKey);
 
+            if (!IsParentForeground())
+            {
+                if (switcherActive)
+                {
+                    switcherActive = false;
+                    Emit("SWITCHER_CANCEL");
+                }
+                suppressTabUp = false;
+                suppressF12Up = false;
+                suppressEscapeUp = false;
+                suppressWindowsArrowUp = 0;
+                leftWindowsKeyDown = false;
+                rightWindowsKeyDown = false;
+                return CallNextHookEx(hook, code, wParam, lParam);
+            }
+
             if (down && key == VK_LWIN) leftWindowsKeyDown = true;
             else if (up && key == VK_LWIN) leftWindowsKeyDown = false;
             else if (down && key == VK_RWIN) rightWindowsKeyDown = true;
             else if (up && key == VK_RWIN) rightWindowsKeyDown = false;
-            if (key == VK_LWIN || key == VK_RWIN) return new IntPtr(1);
 
             if (down && key == VK_F12 && IsDown(VK_CONTROL) && IsDown(VK_SHIFT))
             {
@@ -228,6 +259,7 @@ public static class PhantomAltTabHook
 
     public static void Run(int parentProcessId)
     {
+        PhantomAltTabHook.parentProcessId = parentProcessId;
         hook = SetWindowsHookEx(WH_KEYBOARD_LL, Callback, IntPtr.Zero, 0);
         if (hook == IntPtr.Zero) throw new InvalidOperationException("SetWindowsHookEx failed: " + Marshal.GetLastWin32Error());
         uint threadId = GetCurrentThreadId();
