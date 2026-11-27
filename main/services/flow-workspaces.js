@@ -8,10 +8,15 @@ const { getAgentCapacity } = require('./flow-capacity');
 
 const WORKSPACE_DIR = 'agent-flow-workspaces';
 const WORKSPACE_PREFIX = 'phantom-agent-flow-';
+const EXCLUDED_DIRECTORIES = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next']);
 
 function internalProjectPath(relative) {
   const parts = relative.split(path.sep);
   return parts[0]?.toLowerCase() === '.phantom' && parts[1]?.toLowerCase() === 'agent-flow.json';
+}
+
+function excludedProjectPath(relative) {
+  return relative.split(path.sep).some((part) => EXCLUDED_DIRECTORIES.has(part.toLowerCase()));
 }
 
 function within(root, target) {
@@ -38,29 +43,36 @@ async function ensureManifestDirectory(core) {
   return directory;
 }
 
-async function fileMap(root) {
+async function fileMap(root, previous = new Map()) {
   const files = new Map();
   async function visit(directory, relative = '') {
     const entries = await fsp.readdir(directory, { withFileTypes: true });
     for (const entry of entries) {
-      if (entry.name.toLowerCase() === '.git') continue;
       const childRelative = relative ? path.join(relative, entry.name) : entry.name;
-      if (internalProjectPath(childRelative)) continue;
+      if (excludedProjectPath(childRelative) || internalProjectPath(childRelative)) continue;
       const absolute = path.join(directory, entry.name);
       const stat = await fsp.lstat(absolute);
       if (stat.isSymbolicLink()) {
         files.set(childRelative, { type: 'link', target: await fsp.readlink(absolute) });
       } else if (stat.isDirectory()) {
+        files.set(childRelative, { type: 'directory' });
         await visit(absolute, childRelative);
       } else if (stat.isFile()) {
-        const digest = createHash('sha256');
-        await new Promise((resolve, reject) => {
-          const stream = fs.createReadStream(absolute);
-          stream.on('data', (chunk) => digest.update(chunk));
-          stream.on('error', reject);
-          stream.on('end', resolve);
-        });
-        files.set(childRelative, { type: 'file', hash: digest.digest('hex'), mode: stat.mode & 0o777 });
+        const mode = stat.mode & 0o777;
+        const prior = previous.get(childRelative);
+        let hash = prior?.type === 'file' && prior.size === stat.size &&
+          prior.mtimeMs === stat.mtimeMs && prior.mode === mode ? prior.hash : null;
+        if (!hash) {
+          const digest = createHash('sha256');
+          await new Promise((resolve, reject) => {
+            const stream = fs.createReadStream(absolute);
+            stream.on('data', (chunk) => digest.update(chunk));
+            stream.on('error', reject);
+            stream.on('end', resolve);
+          });
+          hash = digest.digest('hex');
+        }
+        files.set(childRelative, { type: 'file', hash, mode, size: stat.size, mtimeMs: stat.mtimeMs });
       }
     }
   }
@@ -80,11 +92,11 @@ async function copyProject(sourceRoot, targetRoot) {
   await fsp.cp(sourceRoot, targetRoot, {
     recursive: true,
     errorOnExist: true,
-    filter: (source) => {
+    preserveTimestamps: true,
+    filter: async (source) => {
       const relative = path.relative(sourceRoot, source);
-      if (relative.split(path.sep).some((part) => part.toLowerCase() === '.git')) return false;
-      if (internalProjectPath(relative)) return false;
-      try { return !fs.lstatSync(source).isSymbolicLink(); }
+      if (excludedProjectPath(relative) || internalProjectPath(relative)) return false;
+      try { return !(await fsp.lstat(source)).isSymbolicLink(); }
       catch (error) {
         if (error.code === 'ENOENT') return false;
         throw error;
@@ -94,7 +106,32 @@ async function copyProject(sourceRoot, targetRoot) {
 }
 
 function equalEntry(left, right) {
-  return JSON.stringify(left || null) === JSON.stringify(right || null);
+  if (!left || !right) return !left && !right;
+  if (left.type !== right.type) return false;
+  if (left.type === 'file') return left.hash === right.hash && left.mode === right.mode;
+  if (left.type === 'link') return left.target === right.target;
+  return true;
+}
+
+async function entryAtPath(root, relative) {
+  const absolute = await inspectTarget(root, relative);
+  let stat;
+  try { stat = await fsp.lstat(absolute); }
+  catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (stat.isSymbolicLink()) return { type: 'link', target: await fsp.readlink(absolute) };
+  if (stat.isDirectory()) return { type: 'directory' };
+  if (!stat.isFile()) return { type: 'other' };
+  const digest = createHash('sha256');
+  await new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(absolute);
+    stream.on('data', (chunk) => digest.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', resolve);
+  });
+  return { type: 'file', hash: digest.digest('hex'), mode: stat.mode & 0o777 };
 }
 
 function safeRelativePath(value) {
@@ -121,7 +158,7 @@ async function inspectTarget(root, relative) {
       const stat = await fsp.lstat(current);
       if (stat.isSymbolicLink()) throw pathConflict(`Integration refused to follow a project symlink: ${relative}`);
       if (index < segments.length - 1 && !stat.isDirectory()) {
-        throw new Error(`Integration path is not a directory: ${relative}`);
+        throw pathConflict(`Integration path is not a directory: ${relative}`);
       }
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
@@ -157,9 +194,63 @@ async function persistManifest(file, data) {
   }
 }
 
+async function cleanupStaleWorkspaces(core) {
+  const directory = await ensureManifestDirectory(core);
+  const tempRoot = path.resolve(os.tmpdir());
+  for (const entry of await fsp.readdir(directory, { withFileTypes: true })) {
+    if (!entry.isFile() || !/^[0-9a-f-]{36}\.json$/i.test(entry.name)) continue;
+    const file = path.join(directory, entry.name);
+    let cleaned = false;
+    try {
+      const { workspaceRoot } = await readManifest(core, entry.name.slice(0, -5));
+      let stat;
+      try { stat = await fsp.lstat(workspaceRoot); }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      if (!stat) cleaned = true;
+      else if (stat.isDirectory() && !stat.isSymbolicLink()) {
+        const realRoot = await fsp.realpath(workspaceRoot);
+        if (!within(tempRoot, realRoot) || !path.basename(realRoot).startsWith(WORKSPACE_PREFIX)) {
+          throw new Error('Stale workspace path failed validation.');
+        }
+        await fsp.rm(realRoot, { recursive: true, force: true });
+        cleaned = true;
+      } else {
+        throw new Error('Stale workspace root is not a real directory.');
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') core.log('error', `Stale Agent Flow workspace cleanup failed: ${error.message}`, 'FLOW');
+    }
+    if (cleaned) {
+      await fsp.unlink(file).catch((error) => {
+        if (error.code !== 'ENOENT') core.log('error', `Stale Agent Flow manifest cleanup failed: ${error.message}`, 'FLOW');
+      });
+    }
+  }
+
+}
+
+async function removePartialWorkspace(core, workspaceRoot, file) {
+  const errors = [];
+  let rootRemoved = true;
+  try { await fsp.rm(workspaceRoot, { recursive: true, force: true }); }
+  catch (error) { rootRemoved = false; errors.push(error); }
+  if (rootRemoved) {
+    try { await fsp.unlink(file); }
+    catch (error) { if (error.code !== 'ENOENT') errors.push(error); }
+  }
+  if (errors.length) {
+    core.log('error', `Failed to clean up partial Agent Flow workspace: ${errors.map((error) => error.message).join('; ')}`, 'FLOW');
+  }
+}
+
 module.exports = (core) => {
   const liveWorkspaceIds = new Set();
+  const startupCleanup = cleanupStaleWorkspaces(core);
+  startupCleanup.catch((error) => core.log('error', `Agent Flow startup cleanup failed: ${error.message}`, 'FLOW'));
   core.onShutdown(async () => {
+    await startupCleanup;
     for (const id of liveWorkspaceIds) {
       try {
         const { file, workspaceRoot } = await readManifest(core, id);
@@ -176,31 +267,44 @@ module.exports = (core) => {
   'flow:capacity': async () => {
     return getAgentCapacity();
   },
+  'flow:workspace:get': async (id) => {
+    await startupCleanup;
+    try {
+      const workspace = await readManifest(core, id);
+      return { id, root: workspace.data.workerRoot };
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    }
+  },
   'flow:workspace:create': async (rootValue) => {
+    await startupCleanup;
     const root = validateProjectRoot(rootValue);
     const id = randomUUID();
+    const directory = await ensureManifestDirectory(core);
     const workspaceRoot = await fsp.mkdtemp(path.join(os.tmpdir(), WORKSPACE_PREFIX));
     const workerRoot = path.join(workspaceRoot, 'project');
-    const directory = await ensureManifestDirectory(core);
     const file = path.join(directory, `${id}.json`);
     try {
+      await persistManifest(file, { id, root, workerRoot, workspaceRoot, baseline: {}, createdAt: Date.now() });
       const sourceBefore = await fileMap(root);
       await copyProject(root, workerRoot);
-      const sourceAfter = await fileMap(root);
+      const sourceAfter = await fileMap(root, sourceBefore);
       if (!mapsEqual(sourceBefore, sourceAfter)) {
         throw new Error('The active project changed during snapshot creation. Retry the worker batch.');
       }
-      const baseline = Object.fromEntries(await fileMap(workerRoot));
+      const baseline = Object.fromEntries([...sourceBefore].filter(([, entry]) => entry.type !== 'link'));
       const data = { id, root, workerRoot, workspaceRoot, baseline, createdAt: Date.now() };
       await persistManifest(file, data);
       liveWorkspaceIds.add(id);
       return { id, root: workerRoot };
     } catch (error) {
-      await fsp.rm(workspaceRoot, { recursive: true, force: true });
+      await removePartialWorkspace(core, workspaceRoot, file);
       throw error;
     }
   },
   'flow:workspace:clone': async (sourceId) => {
+    await startupCleanup;
     const source = await readManifest(core, sourceId);
     const sourceRoot = path.resolve(source.data.workerRoot);
     if (!within(source.workspaceRoot, sourceRoot) || path.basename(sourceRoot) !== 'project') {
@@ -214,15 +318,16 @@ module.exports = (core) => {
       throw new Error('Agent Flow source snapshot is not a real project directory.');
     }
     const id = randomUUID();
+    const directory = await ensureManifestDirectory(core);
     const workspaceRoot = await fsp.mkdtemp(path.join(os.tmpdir(), WORKSPACE_PREFIX));
     const workerRoot = path.join(workspaceRoot, 'project');
-    const directory = await ensureManifestDirectory(core);
     const file = path.join(directory, `${id}.json`);
     try {
+      await persistManifest(file, {
+        id, root: source.data.root, workerRoot, workspaceRoot,
+        baseline: source.data.baseline, createdAt: Date.now()
+      });
       await copyProject(sourceRoot, workerRoot);
-      if (!mapsEqual(new Map(Object.entries(source.data.baseline || {})), await fileMap(workerRoot))) {
-        throw new Error('The shared Agent Flow snapshot changed while cloning a worker workspace.');
-      }
       const data = {
         id, root: source.data.root, workerRoot, workspaceRoot,
         baseline: source.data.baseline, createdAt: Date.now()
@@ -231,13 +336,14 @@ module.exports = (core) => {
       liveWorkspaceIds.add(id);
       return { id, root: workerRoot };
     } catch (error) {
-      await fsp.rm(workspaceRoot, { recursive: true, force: true });
+      await removePartialWorkspace(core, workspaceRoot, file);
       throw error;
     }
   },
-  'flow:workspace:integrate': async (rootValue, id) => {
+  'flow:workspace:integrate': async (rootValue, id, resolvePaths = []) => {
+    await startupCleanup;
     const root = validateProjectRoot(rootValue);
-    const { file, data, workspaceRoot } = await readManifest(core, id);
+    const { data, workspaceRoot } = await readManifest(core, id);
     if (data.root !== root) throw new Error('Agent Flow workspace belongs to a different project.');
     const workerRoot = path.resolve(data.workerRoot);
     if (!within(workspaceRoot, workerRoot) || path.basename(workerRoot) !== 'project') {
@@ -251,96 +357,296 @@ module.exports = (core) => {
       throw new Error('Agent Flow worker directory failed validation.');
     }
     const baseline = new Map(Object.entries(data.baseline || {}));
-    const workerFiles = await fileMap(workerRoot);
-    const projectFiles = await fileMap(root);
+    const workerFiles = await fileMap(workerRoot, baseline);
     const paths = new Set([...baseline.keys(), ...workerFiles.keys()]);
-    const changed = [...paths].filter((relative) => !equalEntry(baseline.get(relative), workerFiles.get(relative)));
-    if (changed.some((relative) => workerFiles.get(relative)?.type === 'link')) {
-      return { applied: [], conflicts: changed.filter((relative) => workerFiles.get(relative)?.type === 'link'), error: 'Worker-created or changed symbolic links cannot be integrated.' };
+    const changed = new Set([...paths].filter((relative) => !equalEntry(baseline.get(relative), workerFiles.get(relative))));
+    const requestedResolutions = Array.isArray(resolvePaths)
+      ? resolvePaths.filter((relative) => safeRelativePath(relative))
+      : [];
+    const projectFiles = new Map();
+    const projectPaths = new Set([...changed, ...requestedResolutions]);
+    for (const relative of projectPaths) {
+      const segments = relative.split(/[\\/]+/);
+      for (let index = 1; index < segments.length; index++) projectPaths.add(path.join(...segments.slice(0, index)));
     }
-    const conflicts = changed.filter((relative) =>
-      !equalEntry(baseline.get(relative), projectFiles.get(relative)) &&
-      !equalEntry(workerFiles.get(relative), projectFiles.get(relative))
-    );
-    if (conflicts.length) return { applied: [], conflicts, error: 'Project files changed after the worker snapshot; resolve these overlaps before integration.' };
+    for (const relative of projectPaths) {
+      try { projectFiles.set(relative, await entryAtPath(root, relative)); }
+      catch (error) {
+        if (error.code === 'FLOW_PATH_CONFLICT') projectFiles.set(relative, { type: 'link' });
+        else throw error;
+      }
+    }
+    const conflicts = new Set();
+    const resolved = new Set();
+    const shapeConflicts = new Set();
+    for (const relative of changed) {
+      const before = baseline.get(relative);
+      const after = workerFiles.get(relative);
+      if (after?.type === 'link' || before && after && before.type !== after.type &&
+          (before.type === 'file' || after.type === 'file')) {
+        conflicts.add(relative);
+        shapeConflicts.add(relative);
+      }
+    }
+
+    for (const relative of requestedResolutions) {
+      const workerEntry = workerFiles.get(relative);
+      const baselineEntry = baseline.get(relative);
+      const projectEntry = projectFiles.get(relative);
+      if (equalEntry(workerEntry, projectEntry) || equalEntry(workerEntry, baselineEntry)) {
+        resolved.add(relative);
+        changed.delete(relative);
+      } else if (!changed.has(relative)) {
+        changed.add(relative);
+      }
+    }
+    for (const relative of changed) {
+      if (workerFiles.get(relative)?.type === 'link') {
+        conflicts.add(relative);
+        continue;
+      }
+      const shapeConflict = [...shapeConflicts].some((parent) => relative === parent || relative.startsWith(`${parent}${path.sep}`));
+      if (shapeConflict) continue;
+      if (!equalEntry(baseline.get(relative), projectFiles.get(relative)) &&
+          !equalEntry(workerFiles.get(relative), projectFiles.get(relative))) conflicts.add(relative);
+      const segments = relative.split(/[\\/]+/);
+      for (let index = 1; index < segments.length; index++) {
+        const parent = path.join(...segments.slice(0, index));
+        const baselineParent = baseline.get(parent);
+        const projectParent = projectFiles.get(parent);
+        if (projectParent && projectParent.type !== 'directory' ||
+            baselineParent?.type === 'directory' && !projectParent) {
+          conflicts.add(relative);
+          break;
+        }
+      }
+    }
 
     const operations = [];
     for (const relative of changed) {
+      if (conflicts.has(relative) || [...shapeConflicts].some((parent) => relative.startsWith(`${parent}${path.sep}`))) continue;
       if (equalEntry(workerFiles.get(relative), projectFiles.get(relative))) continue;
       let destination;
       try { destination = await inspectTarget(root, relative); }
       catch (error) {
         if (error.code === 'FLOW_PATH_CONFLICT') {
-          return { applied: [], conflicts: [relative], error: error.message };
+          conflicts.add(relative);
+          continue;
         }
         throw error;
       }
       try {
         const destinationStat = await fsp.lstat(destination);
-        if (destinationStat.isSymbolicLink() || !destinationStat.isFile()) {
-          return { applied: [], conflicts: [relative], error: 'Worker output conflicts with a non-file project path.' };
+        const desired = workerFiles.get(relative);
+        if (destinationStat.isSymbolicLink() ||
+            (desired?.type === 'file' && !destinationStat.isFile()) ||
+            (desired?.type === 'directory' && !destinationStat.isDirectory())) {
+          conflicts.add(relative);
+          continue;
         }
       } catch (error) {
         if (error.code !== 'ENOENT') throw error;
       }
-      if (workerFiles.has(relative)) {
+      const desired = workerFiles.get(relative);
+      if (desired?.type === 'directory') {
+        operations.push({ relative, destination, type: 'mkdir' });
+      } else if (desired?.type === 'file') {
         const source = path.join(workerRoot, relative);
         const sourceStat = await fsp.lstat(source);
         if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
-          return { applied: [], conflicts: [relative], error: 'Only regular worker files can be integrated.' };
+          conflicts.add(relative);
+          continue;
         }
         operations.push({ relative, destination, source, type: 'write' });
+      } else if (baseline.get(relative)?.type === 'directory') {
+        operations.push({ relative, destination, type: 'rmdir' });
       } else {
         operations.push({ relative, destination, type: 'delete' });
       }
     }
+    operations.sort((left, right) => {
+      const rank = (operation) => operation.type === 'mkdir' ? 0 : operation.type === 'rmdir' ? 2 : 1;
+      const rankDifference = rank(left) - rank(right);
+      if (rankDifference) return rankDifference;
+      const depthDifference = left.relative.split(path.sep).length - right.relative.split(path.sep).length;
+      return left.type === 'rmdir' ? -depthDifference : depthDifference;
+    });
 
     const backups = [];
     const applied = [];
+    const integratedEntries = new Map();
+    const parentPathsMatch = async (relative) => {
+      const segments = relative.split(/[\\/]+/);
+      for (let index = 1; index < segments.length; index++) {
+        const parent = path.join(...segments.slice(0, index));
+        const expectedParent = integratedEntries.has(parent) ? integratedEntries.get(parent) : projectFiles.get(parent);
+        const currentParent = await entryAtPath(root, parent).catch((error) => {
+          if (error.code === 'FLOW_PATH_CONFLICT') return { type: 'link' };
+          throw error;
+        });
+        if (!equalEntry(currentParent, expectedParent)) return false;
+      }
+      return true;
+    };
     try {
       for (const operation of operations) {
         const destination = await inspectTarget(root, operation.relative);
-        await fsp.mkdir(path.dirname(destination), { recursive: true });
-        await inspectTarget(root, operation.relative);
-        let previous = null;
-        let previousMode = null;
-        try {
-          const stat = await fsp.lstat(destination);
-          if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Integration refused to replace a non-file path: ${operation.relative}`);
-          previous = await fsp.readFile(destination);
-          previousMode = stat.mode & 0o777;
-        } catch (error) {
-          if (error.code !== 'ENOENT') throw error;
-        }
-        backups.push({ destination, previous, previousMode });
-        if (operation.type === 'delete') {
-          if (previous !== null) await fsp.unlink(destination);
-        } else {
-          const temp = `${destination}.${randomUUID()}.tmp`;
-          await fsp.copyFile(operation.source, temp, fs.constants.COPYFILE_EXCL);
-          const sourceStat = await fsp.stat(operation.source);
-          await fsp.chmod(temp, sourceStat.mode & 0o777);
-          try { await fsp.rename(temp, destination); }
-          catch (error) {
-            await fsp.unlink(temp).catch(() => {});
-            throw error;
+        await core.withFileLock(destination, async () => {
+          if (!(await parentPathsMatch(operation.relative))) {
+            conflicts.add(operation.relative);
+            return;
           }
-        }
-        applied.push(operation.relative);
+          const before = await entryAtPath(root, operation.relative).catch((error) => {
+            if (error.code === 'FLOW_PATH_CONFLICT') return { type: 'link' };
+            throw error;
+          });
+          if (!equalEntry(before, projectFiles.get(operation.relative))) {
+            conflicts.add(operation.relative);
+            return;
+          }
+
+          let previous = null;
+          let previousMode = null;
+          let previousType = null;
+          try {
+            const stat = await fsp.lstat(destination);
+            if (stat.isSymbolicLink()) {
+              conflicts.add(operation.relative);
+              return;
+            }
+            if (stat.isFile()) {
+              previous = await fsp.readFile(destination);
+              previousMode = stat.mode & 0o777;
+              previousType = 'file';
+            } else if (stat.isDirectory()) previousType = 'directory';
+            else {
+              conflicts.add(operation.relative);
+              return;
+            }
+          } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+          }
+
+          const latest = await entryAtPath(root, operation.relative).catch((error) => {
+            if (error.code === 'FLOW_PATH_CONFLICT') return { type: 'link' };
+            throw error;
+          });
+          if (!equalEntry(latest, projectFiles.get(operation.relative))) {
+            conflicts.add(operation.relative);
+            return;
+          }
+
+          if (operation.type === 'write' || operation.type === 'mkdir') await fsp.mkdir(path.dirname(destination), { recursive: true });
+          if (!(await parentPathsMatch(operation.relative))) {
+            conflicts.add(operation.relative);
+            return;
+          }
+          const latestBeforeMutation = await entryAtPath(root, operation.relative).catch((error) => {
+            if (error.code === 'FLOW_PATH_CONFLICT') return { type: 'link' };
+            throw error;
+          });
+          if (!equalEntry(latestBeforeMutation, projectFiles.get(operation.relative))) {
+            conflicts.add(operation.relative);
+            return;
+          }
+          if (operation.type === 'rmdir') {
+            try { await fsp.rmdir(destination); }
+            catch (error) {
+              if (error.code === 'ENOTEMPTY' || error.code === 'EEXIST' || error.code === 'ENOENT') {
+                conflicts.add(operation.relative);
+                return;
+              }
+              throw error;
+            }
+          } else if (operation.type === 'mkdir') {
+            try { await fsp.mkdir(destination); }
+            catch (error) {
+              if (error.code === 'EEXIST') {
+                conflicts.add(operation.relative);
+                return;
+              }
+              throw error;
+            }
+          } else if (operation.type === 'delete') {
+            if (previous !== null) {
+              try { await fsp.unlink(destination); }
+              catch (error) {
+                if (error.code === 'ENOENT') {
+                  conflicts.add(operation.relative);
+                  return;
+                }
+                throw error;
+              }
+            }
+          } else {
+            const temp = `${destination}.${randomUUID()}.tmp`;
+            await fsp.copyFile(operation.source, temp, fs.constants.COPYFILE_EXCL);
+            const sourceStat = await fsp.stat(operation.source);
+            await fsp.chmod(temp, sourceStat.mode & 0o777);
+            if (!(await parentPathsMatch(operation.relative))) {
+              await fsp.unlink(temp);
+              conflicts.add(operation.relative);
+              return;
+            }
+            const immediatelyBeforeWrite = await entryAtPath(root, operation.relative).catch((error) => {
+              if (error.code === 'FLOW_PATH_CONFLICT') return { type: 'link' };
+              throw error;
+            });
+            if (!equalEntry(immediatelyBeforeWrite, projectFiles.get(operation.relative))) {
+              await fsp.unlink(temp);
+              conflicts.add(operation.relative);
+              return;
+            }
+            try { await fsp.rename(temp, destination); }
+            catch (error) {
+              await fsp.unlink(temp).catch(() => {});
+              throw error;
+            }
+          }
+          const expectedAfter = operation.type === 'delete' || operation.type === 'rmdir'
+            ? null
+            : operation.type === 'mkdir' ? { type: 'directory' } : workerFiles.get(operation.relative);
+          backups.push({ destination, relative: operation.relative, previous, previousMode, previousType, expectedAfter });
+          applied.push(operation.relative);
+          integratedEntries.set(operation.relative, expectedAfter);
+        });
       }
     } catch (error) {
       for (const backup of backups.reverse()) {
-        if (backup.previous === null) await fsp.unlink(backup.destination).catch(() => {});
-        else {
-          await fsp.writeFile(backup.destination, backup.previous).catch(() => {});
-          if (backup.previousMode !== null) await fsp.chmod(backup.destination, backup.previousMode).catch(() => {});
+        try {
+          await core.withFileLock(backup.destination, async () => {
+            if (!equalEntry(await entryAtPath(root, backup.relative), backup.expectedAfter)) {
+              conflicts.add(backup.relative);
+              return;
+            }
+            if (backup.previousType === 'directory') await fsp.mkdir(backup.destination);
+            else if (backup.previousType === 'file') {
+              const temp = `${backup.destination}.${randomUUID()}.rollback`;
+              await fsp.writeFile(temp, backup.previous, { flag: 'wx' });
+              if (backup.previousMode !== null) await fsp.chmod(temp, backup.previousMode);
+              await fsp.rename(temp, backup.destination);
+            } else if (backup.expectedAfter?.type === 'directory') {
+              await fsp.rmdir(backup.destination);
+            } else if (backup.expectedAfter !== null) {
+              await fsp.unlink(backup.destination);
+            }
+          });
+        } catch (rollbackError) {
+          core.log('error', `Agent Flow integration rollback failed for ${backup.relative}: ${rollbackError.message}`, 'FLOW');
         }
       }
       throw error;
     }
-    return { applied, conflicts: [] };
+    const unresolved = [...new Set([...conflicts])];
+    return {
+      applied,
+      conflicts: unresolved,
+      resolved: [...resolved],
+      error: unresolved.length ? 'Some worker changes conflicted with the current project and were not applied.' : ''
+    };
   },
   'flow:workspace:dispose': async (id) => {
+    await startupCleanup;
     let workspace;
     try { workspace = await readManifest(core, id); }
     catch (error) {

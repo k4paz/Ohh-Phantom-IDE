@@ -18,9 +18,21 @@ function createCore({ dataDir, emit, platformHooks = {} }) {
   bus.setMaxListeners(100);
   const shutdownHooks = [];
   const logBuffer = [];
+  const fileWriteQueues = new Map();
+  const withFileLock = (file, action) => {
+    const resolved = path.resolve(file);
+    const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+    const previous = fileWriteQueues.get(key) || Promise.resolve();
+    const current = previous.catch(() => {}).then(action);
+    fileWriteQueues.set(key, current);
+    return current.finally(() => {
+      if (fileWriteQueues.get(key) === current) fileWriteQueues.delete(key);
+    });
+  };
 
   const core = {
     dataDir,
+    withFileLock,
     bus,
     hooks: platformHooks, // electron-only capabilities: dialog, trash, reveal, window controls
     emit(channel, payload) {

@@ -43,16 +43,18 @@ module.exports = (core) => ({
   'fs:write': async (p, content) => {
     p = abs(p);
     if (typeof content !== 'string') throw new Error('content must be a string');
-    let mode = null;
-    try { mode = (await fsp.stat(p)).mode; } catch { /* new file */ }
-    // Write-then-rename keeps the original intact if the write fails midway.
-    const tmp = path.join(path.dirname(p), `.${path.basename(p)}.phantom-${process.pid}-${Date.now()}`);
-    await fsp.writeFile(tmp, content, 'utf8');
-    if (mode !== null) await fsp.chmod(tmp, mode).catch(() => {});
-    try { await fsp.rename(tmp, p); }
-    catch (e) { await fsp.writeFile(p, content, 'utf8'); await fsp.unlink(tmp).catch(() => {}); if (e.code !== 'EXDEV' && e.code !== 'EPERM') throw e; }
-    const st = await fsp.stat(p);
-    return { mtime: st.mtimeMs, size: st.size };
+    return core.withFileLock(p, async () => {
+      let mode = null;
+      try { mode = (await fsp.stat(p)).mode; } catch { /* new file */ }
+      // Write-then-rename keeps the original intact if the write fails midway.
+      const tmp = path.join(path.dirname(p), `.${path.basename(p)}.phantom-${process.pid}-${Date.now()}`);
+      await fsp.writeFile(tmp, content, 'utf8');
+      if (mode !== null) await fsp.chmod(tmp, mode).catch(() => {});
+      try { await fsp.rename(tmp, p); }
+      catch (e) { await fsp.writeFile(p, content, 'utf8'); await fsp.unlink(tmp).catch(() => {}); if (e.code !== 'EXDEV' && e.code !== 'EPERM') throw e; }
+      const st = await fsp.stat(p);
+      return { mtime: st.mtimeMs, size: st.size };
+    });
   },
 
   'fs:stat': async (p) => {

@@ -33,7 +33,8 @@ export function validateRoadmapPlan(action) {
   });
   const workerIds = new Set();
   const assignments = action.assignments.map((assignment) => {
-    if (!assignment || !validId(assignment.workerId) || reservedWorkerIds.has(assignment.workerId) || workerIds.has(assignment.workerId)) {
+    if (!assignment || !validId(assignment.workerId) || reservedWorkerIds.has(assignment.workerId) ||
+        /^reviewer-\d+$/.test(assignment.workerId) || workerIds.has(assignment.workerId)) {
       throw new Error('Every delegated workstream needs a unique valid workerId.');
     }
     const task = typeof assignment.task === 'string' ? assignment.task.trim() : '';

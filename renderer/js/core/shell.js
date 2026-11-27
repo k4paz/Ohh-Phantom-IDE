@@ -212,6 +212,11 @@ function buildTopbar() {
       { label: 'Cascade', action: () => wm.cascade() },
       { label: 'Show desktop', key: 'Ctrl+Alt+D', action: () => wm.showDesktop() },
       { label: 'Cycle windows', key: 'Ctrl+Tab', action: () => wm.cycle(1) },
+      ...[['ArrowLeft', '←'], ['ArrowRight', '→'], ['ArrowUp', '↑'], ['ArrowDown', '↓']].map(([keyName, hint]) => ({
+        label: `Snap focused window ${keyName.slice(5).toLowerCase()}`,
+        key: platform === 'win32' ? `Win+${hint} (kiosk) / Ctrl+Alt+Shift+${hint}` : `Ctrl+Alt+Shift+${hint}`,
+        action: () => snapFocusedWindow(keyName)
+      })),
       '-',
       { label: 'Snapping to edges', check: settings.snap, action: () => setSetting('snap', !settings.snap) },
       { label: 'Magnetic alignment', check: settings.magnet > 0, action: () => setSetting('magnet', settings.magnet > 0 ? 0 : 10) },
@@ -336,7 +341,7 @@ function buildTaskbar() {
     const list = wm.windows.filter((w) => w.ws === wm.active).sort((a, b) => a.id - b.id);
     tasks.innerHTML = '';
     for (const [index, w] of list.entries()) {
-      const shortcut = index < 9 ? ` · Shift+${index + 1}` : '';
+      const shortcut = index < 9 ? ` · Shift+${index + 1} (double-press resets desktop)` : '';
       const b = h('button.task' + (w === wm.focused ? '.focus' : '') + (w.min ? '.min' : ''), { 'data-win': w.id, title: `${w.title}${w.sub ? ' — ' + w.sub : ''}${shortcut}`, html: `${icon(w.app.icon)}<span>${esc(w.title)}${w.sub ? ' <span class="c-dim">' + esc(basename(w.sub)) + '</span>' : ''}</span>${w.pinned ? '<span class="pin">▲</span>' : ''}` });
       b.addEventListener('click', () => { if (w === wm.focused && !w.min) wm.minimize(w); else { wm.restore(w); wm.focus(w); } });
       b.addEventListener('auxclick', (e) => { if (e.button === 1) wm.close(w); });
@@ -475,10 +480,12 @@ function keybindings() {
       wm.switchWorkspace(digit - 1);
     }
     else if (!ctrl && e.shiftKey && !e.altKey && digit >= 1 && digit <= 9) {
-      stop();
+      const target = e.target instanceof Element ? e.target : null;
+      if (target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], .monaco-editor, .xterm')) return;
       const task = document.querySelector(`#taskbar .tasks .task:nth-child(${digit})`);
       const win = task && wm.windows.find((item) => item.id === Number(task.dataset.win));
       if (win) {
+        stop();
         const now = performance.now();
         const repeated = !e.repeat && lastTaskShortcut?.digit === digit && lastTaskShortcut.win === win
           && now - lastTaskShortcut.at <= 800;
@@ -525,6 +532,7 @@ function keybindings() {
     else if (ctrl && e.altKey && /^Digit[1-4]$/.test(e.code)) { stop(); const i = Number(e.code.slice(5)) - 1; if (e.shiftKey && f) wm.moveToWorkspace(f, i); else wm.switchWorkspace(i); }
     else if (ctrl && e.altKey && (k === 't' || k === 'T')) { stop(); wm.tile(); }
     else if (ctrl && e.altKey && (k === 'd' || k === 'D')) { stop(); wm.showDesktop(); }
+    else if (ctrl && e.altKey && e.shiftKey && f && k.startsWith('Arrow')) { stop(); snapFocusedWindow(k); }
     else if (platform === 'win32' && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && f && k.startsWith('Arrow')) {
       stop();
       snapFocusedWindow(k);

@@ -212,6 +212,14 @@ const assert = (c, m) => { if (!c) throw new Error('assert: ' + m); };
       assignments: [{ workerId: 'worker-1', task: 'Implement the feature', goalIds: ['feature'] }]
     });
     assert(plan.assignments.length === 1, 'accept a scoped worker assignment');
+    let reviewerCollisionRejected = false;
+    try {
+      validateRoadmapPlan({
+        goals: [{ id: 'feature', title: 'Deliver the feature', acceptanceCriteria: ['The feature works'] }],
+        assignments: [{ workerId: 'reviewer-1', task: 'Implement the feature', goalIds: ['feature'] }]
+      });
+    } catch { reviewerCollisionRejected = true; }
+    assert(reviewerCollisionRejected, 'reserve generated reviewer IDs for review results');
     assert(validateGoalEvidence([{ goalId: 'feature', evidence: 'Tested successfully' }], plan.goals).length === 1, 'require evidence for each goal');
     for (const invalid of [
       { goals: [], assignments: [{ workerId: 'worker-1', task: 'work', goalIds: [] }] },
@@ -242,6 +250,25 @@ const assert = (c, m) => { if (!c) throw new Error('assert: ' + m); };
   console.log('\nfs / store');
   await t('fs:list', async () => { const l = await call('fs:list', proj); assert(l[0].dir && l[0].name === 'src', 'dirs first'); return l.map((x) => x.name).join(' '); });
   await t('fs:write + read', async () => { const p = path.join(proj, 'x.txt'); await call('fs:write', p, 'hello\n'); const r = await call('fs:read', p); assert(r.content === 'hello\n', 'content'); fs.unlinkSync(p); return r.eol; });
+  await t('project writes serialize against integration locks', async () => {
+    const file = path.join(proj, 'locked-write.txt');
+    let release;
+    let entered;
+    const enteredLock = new Promise((resolve) => { entered = resolve; });
+    const heldWrite = core.withFileLock(file, async () => {
+      entered();
+      await new Promise((resolve) => { release = resolve; });
+      await fs.promises.writeFile(file, 'earlier write\n');
+    });
+    await enteredLock;
+    const queuedWrite = call('fs:write', file, 'latest write\n');
+    await sleep(10);
+    release();
+    await Promise.all([heldWrite, queuedWrite]);
+    assert(fs.readFileSync(file, 'utf8') === 'latest write\n', 'the serialized later save is not overwritten');
+    fs.unlinkSync(file);
+    return 'same-path app writes run in lock order';
+  });
   await t('fs:walk', async () => (await call('fs:walk', proj)).length + ' files');
   await t('fs:rename refuses overwrite', async () => { try { await call('fs:rename', path.join(proj, 'config.js'), path.join(proj, 'package.json')); } catch (e) { return e.message; } throw new Error('no error'); });
   await t('Agent Flow saves and loads from the project directory', async () => {
@@ -271,11 +298,14 @@ const assert = (c, m) => { if (!c) throw new Error('assert: ' + m); };
     const originalContent = fs.readFileSync(projectFile, 'utf8');
     fs.mkdirSync(path.join(proj, '.git'));
     fs.writeFileSync(path.join(proj, '.git', 'private-marker'), 'not copied');
+    fs.mkdirSync(path.join(proj, 'node_modules'));
+    fs.writeFileSync(path.join(proj, 'node_modules', 'private-marker'), 'not copied');
     const snapshot = await call('flow:workspace:create', proj);
     try {
       const workerFile = path.join(snapshot.root, 'src', 'a.js');
       assert(fs.readFileSync(workerFile, 'utf8') === fs.readFileSync(path.join(proj, 'src', 'a.js'), 'utf8'), 'snapshot includes current project content');
       assert(!fs.existsSync(path.join(snapshot.root, '.git')), 'snapshot excludes Git internals');
+      assert(!fs.existsSync(path.join(snapshot.root, 'node_modules')), 'snapshot excludes dependency directories');
       assert(!fs.existsSync(path.join(snapshot.root, '.phantom', 'agent-flow.json')), 'snapshot excludes its own workflow configuration');
       fs.writeFileSync(workerFile, 'worker implementation\n');
       fs.writeFileSync(path.join(snapshot.root, 'src', 'worker-new.js'), 'new worker file\n');
@@ -289,6 +319,7 @@ const assert = (c, m) => { if (!c) throw new Error('assert: ' + m); };
       fs.writeFileSync(projectFile, originalContent);
       fs.rmSync(path.join(proj, 'src', 'worker-new.js'), { force: true });
       fs.rmSync(path.join(proj, '.git'), { recursive: true, force: true });
+      fs.rmSync(path.join(proj, 'node_modules'), { recursive: true, force: true });
     }
   });
   await t('Agent Flow refuses overlapping worker edits without overwriting the project', async () => {
@@ -311,6 +342,50 @@ const assert = (c, m) => { if (!c) throw new Error('assert: ' + m); };
       fs.rmSync(path.join(proj, 'src', 'unrelated.js'), { force: true });
     }
   });
+  await t('Agent Flow integrates clean files alongside overlapping edits', async () => {
+    const projectFile = path.join(proj, 'src', 'a.js');
+    const originalContent = fs.readFileSync(projectFile, 'utf8');
+    const snapshot = await call('flow:workspace:create', proj);
+    try {
+      fs.writeFileSync(path.join(snapshot.root, 'src', 'a.js'), 'worker version\n');
+      fs.writeFileSync(path.join(snapshot.root, 'src', 'worker-clean.js'), 'safe worker change\n');
+      fs.writeFileSync(projectFile, 'user version\n');
+      fs.mkdirSync(path.join(snapshot.root, 'src', 'new-parent'));
+      fs.writeFileSync(path.join(snapshot.root, 'src', 'new-parent', 'child.js'), 'blocked by project file\n');
+      fs.writeFileSync(path.join(proj, 'src', 'new-parent'), 'project file blocks worker directory\n');
+      const result = await call('flow:workspace:integrate', proj, snapshot.id);
+      assert(result.conflicts.includes(path.join('src', 'a.js')), 'report the overlapping edit');
+      assert(result.conflicts.includes(path.join('src', 'new-parent')), 'treat a non-directory parent as a conflict');
+      assert(result.applied.includes(path.join('src', 'worker-clean.js')), 'integrate the clean edit from the same worker');
+      assert(fs.readFileSync(projectFile, 'utf8') === 'user version\n', 'preserve the current conflicting project file');
+      assert(fs.readFileSync(path.join(proj, 'src', 'new-parent'), 'utf8') === 'project file blocks worker directory\n', 'preserve conflicting non-directory parent');
+      assert(fs.readFileSync(path.join(proj, 'src', 'worker-clean.js'), 'utf8') === 'safe worker change\n', 'write the clean worker file');
+      fs.writeFileSync(path.join(snapshot.root, 'src', 'a.js'), 'user version\n');
+      const resolved = await call('flow:workspace:integrate', proj, snapshot.id, [path.join('src', 'a.js')]);
+      assert(!resolved.conflicts.includes(path.join('src', 'a.js')) && resolved.resolved.includes(path.join('src', 'a.js')), 'explicitly resolve the prior conflict by accepting the project version');
+      return 'non-overlapping edit integrated; conflict can be explicitly resolved';
+    } finally {
+      await call('flow:workspace:dispose', snapshot.id);
+      fs.writeFileSync(projectFile, originalContent);
+      fs.rmSync(path.join(proj, 'src', 'worker-clean.js'), { force: true });
+      fs.rmSync(path.join(proj, 'src', 'new-parent'), { force: true });
+    }
+  });
+  await t('Agent Flow reports file-to-directory replacement as a conflict', async () => {
+    const projectFile = path.join(proj, 'src', 'a.js');
+    const originalContent = fs.readFileSync(projectFile, 'utf8');
+    const snapshot = await call('flow:workspace:create', proj);
+    try {
+      fs.unlinkSync(path.join(snapshot.root, 'src', 'a.js'));
+      fs.mkdirSync(path.join(snapshot.root, 'src', 'a.js'));
+      const result = await call('flow:workspace:integrate', proj, snapshot.id);
+      assert(result.conflicts.includes(path.join('src', 'a.js')), 'report the unsupported file/directory replacement');
+      assert(fs.readFileSync(projectFile, 'utf8') === originalContent, 'do not delete the original project file');
+      return 'replacement reported without deleting source';
+    } finally {
+      await call('flow:workspace:dispose', snapshot.id);
+    }
+  });
   await t('Agent Flow clones every concurrent worker from one immutable snapshot', async () => {
     const projectFile = path.join(proj, 'src', 'a.js');
     const originalContent = fs.readFileSync(projectFile, 'utf8');
@@ -327,6 +402,32 @@ const assert = (c, m) => { if (!c) throw new Error('assert: ' + m); };
       if (clone) await call('flow:workspace:dispose', clone.id);
       await call('flow:workspace:dispose', base.id);
       fs.writeFileSync(projectFile, originalContent);
+    }
+  });
+  await t('Agent Flow removes manifests and snapshots left by a crashed process', async () => {
+    const staleDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phantom-stale-data-'));
+    const staleWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'phantom-agent-flow-stale-'));
+    const id = '11111111-1111-4111-8111-111111111111';
+    const manifestDir = path.join(staleDataDir, 'agent-flow-workspaces');
+    fs.mkdirSync(path.join(staleWorkspace, 'project'));
+    fs.mkdirSync(manifestDir);
+    fs.writeFileSync(path.join(manifestDir, `${id}.json`), JSON.stringify({
+      id,
+      root: proj,
+      workerRoot: path.join(staleWorkspace, 'project'),
+      workspaceRoot: staleWorkspace,
+      baseline: {},
+      createdAt: Date.now()
+    }));
+    const staleCore = createCore({ dataDir: staleDataDir, emit: () => {} });
+    try {
+      assert(await staleCore.handlers.get('flow:workspace:get')(id) === null, 'stale workspace is unavailable after startup');
+      assert(!fs.existsSync(staleWorkspace), 'stale snapshot directory is removed');
+      assert(!fs.existsSync(path.join(manifestDir, `${id}.json`)), 'stale manifest is removed');
+      return 'manifest and project copy cleaned on startup';
+    } finally {
+      await staleCore.shutdown();
+      fs.rmSync(staleDataDir, { recursive: true, force: true });
     }
   });
   await t('store set/get', async () => { await call('store:set', 'layouts', { a: 1 }); const v = await call('store:get', 'layouts'); assert(v.a === 1, 'v'); return JSON.stringify(v); });

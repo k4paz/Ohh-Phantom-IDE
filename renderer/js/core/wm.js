@@ -69,7 +69,7 @@ export class WindowManager {
     this.cycleOrder = null;
     this.cycling = false;
     this.windowSwitcher = null;
-    this.windowSwitcherTimer = null;
+    bus.on('wm:changed', () => this.refreshWindowSwitcher());
   }
 
   init(desktop) {
@@ -392,7 +392,6 @@ export class WindowManager {
       };
       this.windowSwitcherEl.classList.add('on');
       this.windowSwitcherEl.setAttribute('aria-hidden', 'false');
-      this.windowSwitcherTimer = setInterval(() => this.refreshWindowSwitcher(), 500);
       this.renderWindowSwitcher();
       return;
     }
@@ -402,7 +401,7 @@ export class WindowManager {
     this.windowSwitcher.windows = windows;
     const index = windows.indexOf(current);
     this.windowSwitcher.selectedIndex = ((index < 0 ? 0 : index) - direction + windows.length) % windows.length;
-    this.renderWindowSwitcher();
+    this.refreshWindowSwitcher();
   }
   renderWindowSwitcher() {
     const state = this.windowSwitcher;
@@ -421,8 +420,9 @@ export class WindowManager {
       clone.removeAttribute('id');
       clone.querySelectorAll('.pw-ctrl, .pw-rz, .pw-size').forEach((el) => el.remove());
       clone.querySelectorAll('[id]').forEach((el) => el.removeAttribute('id'));
+      const sourceInputs = win.el.querySelectorAll('input, textarea, select');
       clone.querySelectorAll('input, textarea, select').forEach((el, inputIndex) => {
-        const source = win.el.querySelectorAll('input, textarea, select')[inputIndex];
+        const source = sourceInputs[inputIndex];
         if (!source) return;
         if ('value' in el) el.value = source.value;
         if ('checked' in el) el.checked = source.checked;
@@ -467,16 +467,26 @@ export class WindowManager {
     const selected = state.windows[state.selectedIndex];
     const windows = this.windowSwitcherOrder();
     if (!windows.length) return this.cancelWindowSwitcher();
+    const listChanged = windows.length !== state.windows.length ||
+      windows.some((win, index) => win !== state.windows[index]);
     const selectedIndex = windows.indexOf(selected);
     state.windows = windows;
     state.selectedIndex = selectedIndex < 0
       ? Math.min(state.selectedIndex, windows.length - 1)
       : selectedIndex;
-    this.renderWindowSwitcher();
+    if (listChanged) this.renderWindowSwitcher();
+    else {
+      state.windows.forEach((win, index) => {
+        const card = this.windowSwitcherGrid.children[index];
+        if (!card) return;
+        const title = card.querySelector('.window-switcher-title');
+        if (title && title.textContent !== win.title) title.textContent = win.title;
+        card.setAttribute('aria-label', `${win.title} — ${win.app.title}`);
+      });
+      this.selectWindowSwitcherItem(state.selectedIndex);
+    }
   }
   closeWindowSwitcher() {
-    if (this.windowSwitcherTimer) clearInterval(this.windowSwitcherTimer);
-    this.windowSwitcherTimer = null;
     this.windowSwitcher = null;
     this.windowSwitcherGrid.replaceChildren();
     this.windowSwitcherEl.classList.remove('on');

@@ -393,6 +393,26 @@ export default {
       saved.integrationReports = Array.isArray(saved.integrationReports) ? saved.integrationReports : [];
       saved.unresolvedConflicts = Array.isArray(saved.unresolvedConflicts) ? saved.unresolvedConflicts : [];
       saved.workspaceIds = Array.isArray(saved.workspaceIds) ? saved.workspaceIds : [];
+      saved.workspaceByWorker = saved.workspaceByWorker && typeof saved.workspaceByWorker === 'object' ? saved.workspaceByWorker : {};
+      saved.unresolvedConflictOwners = saved.unresolvedConflictOwners && typeof saved.unresolvedConflictOwners === 'object' ? saved.unresolvedConflictOwners : {};
+      if (!Object.keys(saved.unresolvedConflictOwners).length && saved.integrationReports.length) {
+        const owners = {};
+        for (const report of saved.integrationReports) {
+          if (!report || typeof report.workerId !== 'string') continue;
+          for (const file of [...(report.applied || []), ...(report.resolved || [])]) {
+            const remaining = (owners[file] || []).filter((id) => id !== report.workerId);
+            if (remaining.length) owners[file] = remaining;
+            else delete owners[file];
+          }
+          for (const file of report.conflicts || []) {
+            owners[file] = [...new Set([...(owners[file] || []), report.workerId])];
+          }
+        }
+        saved.unresolvedConflictOwners = owners;
+        saved.unresolvedConflicts = Object.keys(owners);
+        const conflictedWorkers = new Set(Object.values(owners).flat());
+        saved.completedWorkers = saved.completedWorkers.filter((id) => !conflictedWorkers.has(id));
+      }
       if (saved.version === 1 && saved.status !== 'complete') {
         saved.version = 2;
         saved.phase = 'plan';
@@ -2002,30 +2022,42 @@ export default {
       runCheckpoint.integrationReports = Array.isArray(runCheckpoint.integrationReports) ? runCheckpoint.integrationReports : [];
       runCheckpoint.unresolvedConflicts = Array.isArray(runCheckpoint.unresolvedConflicts) ? runCheckpoint.unresolvedConflicts : [];
       runCheckpoint.workspaceIds = Array.isArray(runCheckpoint.workspaceIds) ? runCheckpoint.workspaceIds : [];
+      runCheckpoint.workspaceByWorker = runCheckpoint.workspaceByWorker && typeof runCheckpoint.workspaceByWorker === 'object' ? runCheckpoint.workspaceByWorker : {};
+      runCheckpoint.unresolvedConflictOwners = runCheckpoint.unresolvedConflictOwners && typeof runCheckpoint.unresolvedConflictOwners === 'object' ? runCheckpoint.unresolvedConflictOwners : {};
 
       for (let offset = 0; offset < pending.length; offset += batchSize) {
         assertRunCurrent(token);
         const batch = pending.slice(offset, offset + batchSize);
-        const workspaces = [];
-        try {
+        const freshBatch = batch.filter(({ worker }) => !runCheckpoint.workspaceByWorker[worker.id]);
+        const newWorkspaces = new Map();
+        if (freshBatch.length) {
           const baseWorkspace = await call('flow:workspace:create', project.root);
-          workspaces.push({ worker: batch[0].worker, ...baseWorkspace });
+          newWorkspaces.set(freshBatch[0].worker.id, baseWorkspace);
           runCheckpoint.workspaceIds.push(baseWorkspace.id);
+          runCheckpoint.workspaceByWorker[freshBatch[0].worker.id] = baseWorkspace;
           await saveRunCheckpoint();
           assertRunCurrent(token);
-          for (const { worker } of batch.slice(1)) {
+          for (const { worker } of freshBatch.slice(1)) {
             assertRunCurrent(token);
             const workspace = await call('flow:workspace:clone', baseWorkspace.id);
-            workspaces.push({ worker, ...workspace });
+            newWorkspaces.set(worker.id, workspace);
             runCheckpoint.workspaceIds.push(workspace.id);
+            runCheckpoint.workspaceByWorker[worker.id] = workspace;
             await saveRunCheckpoint();
           }
-          runCheckpoint.progress = `${stage} · starting ${batch.length} parallel worker${batch.length === 1 ? '' : 's'}`;
-          await saveRunCheckpoint();
-          const results = await Promise.allSettled(batch.map(async ({ worker, task }, index) => {
+        }
+        const workspaces = batch.map(({ worker }) => ({
+          worker,
+          ...(newWorkspaces.get(worker.id) || runCheckpoint.workspaceByWorker[worker.id])
+        }));
+        if (workspaces.some((workspace) => !workspace.id || !workspace.root)) {
+          throw new Error('A saved Agent Flow worker workspace is invalid. Resume the assignment to create a fresh snapshot.');
+        }
+        runCheckpoint.progress = `${stage} · starting ${batch.length} parallel worker${batch.length === 1 ? '' : 's'}`;
+        await saveRunCheckpoint();
+        const results = await Promise.allSettled(batch.map(async ({ worker, task }, index) => {
             assertRunCurrent(token);
             setNodeStatus(worker.id, 'STARTING', 'running');
-            const workspace = workspaces[index];
             const upstream = reachableInputText(worker, values);
             const prompt = [
               `You are "${worker.label}", a coworker in the PHANTOM manager-led project "${workflow.name}".`,
@@ -2040,57 +2072,71 @@ export default {
               runCheckpoint.resumeMode ? 'This is a resumed assignment. Inspect the current project snapshot first and continue idempotently.' : '',
               'Work only in this isolated workspace and within your assigned scope. Report concrete changes, checks performed, and remaining blockers.'
             ].filter(Boolean).join('\n\n');
-            const result = await runAgent(worker, prompt, token, stage, workspace.root);
+            const result = await runAgent(worker, prompt, token, stage, workspaces[index].root);
             assertRunCurrent(token);
             return { worker, result };
-          }));
-          const failed = results.find((result) => result.status === 'rejected');
-          if (failed) throw failed.reason;
-
-          for (let index = 0; index < results.length; index++) {
-            assertRunCurrent(token);
-            const { worker, result } = results[index].value;
-            values.set(worker.id, result.text);
-            runCheckpoint.values = [...values.entries()];
-            const workspace = workspaces[index];
-            setNodeStatus(worker.id, 'INTEGRATING', 'running');
-            const integrated = await call('flow:workspace:integrate', project.root, workspace.id);
-            const conflicts = Array.isArray(integrated.conflicts) ? integrated.conflicts : [];
-            const report = {
-              workerId: worker.id,
-              applied: integrated.applied || [],
-              conflicts,
-              error: integrated.error || ''
-            };
-            runCheckpoint.integrationReports.push(report);
+        }));
+        let firstFailure = null;
+        for (let index = 0; index < results.length; index++) {
+          assertRunCurrent(token);
+          const settled = results[index];
+          const workspace = workspaces[index];
+          if (settled.status === 'rejected') {
+            firstFailure ||= settled.reason;
+            setNodeStatus(batch[index].worker.id, 'FAILED', 'error');
+            continue;
+          }
+          const { worker, result } = settled.value;
+          values.set(worker.id, result.text);
+          runCheckpoint.values = [...values.entries()];
+          setNodeStatus(worker.id, 'INTEGRATING', 'running');
+          const previousConflicts = Object.entries(runCheckpoint.unresolvedConflictOwners)
+            .filter(([, owners]) => Array.isArray(owners) && owners.includes(worker.id))
+            .map(([file]) => file);
+          const integrated = await call('flow:workspace:integrate', project.root, workspace.id, previousConflicts);
+          const conflicts = Array.isArray(integrated.conflicts) ? integrated.conflicts : [];
+          const report = {
+            workerId: worker.id,
+            applied: integrated.applied || [],
+            conflicts,
+            resolved: Array.isArray(integrated.resolved) ? integrated.resolved : [],
+            error: integrated.error || ''
+          };
+          runCheckpoint.integrationReports.push(report);
+          for (const file of [...report.applied, ...report.resolved]) {
+            const owners = runCheckpoint.unresolvedConflictOwners[file] || [];
+            const remaining = owners.filter((owner) => owner !== worker.id);
+            if (remaining.length) runCheckpoint.unresolvedConflictOwners[file] = remaining;
+            else delete runCheckpoint.unresolvedConflictOwners[file];
+          }
+          for (const file of conflicts) {
+            const owners = runCheckpoint.unresolvedConflictOwners[file] || [];
+            if (!owners.includes(worker.id)) owners.push(worker.id);
+            runCheckpoint.unresolvedConflictOwners[file] = owners;
+          }
+          runCheckpoint.unresolvedConflicts = Object.keys(runCheckpoint.unresolvedConflictOwners);
+          if (!conflicts.length) {
             runCheckpoint.completedWorkers = [...new Set([...runCheckpoint.completedWorkers, worker.id])];
-            runCheckpoint.unresolvedConflicts = [
-              ...new Set([
-                ...runCheckpoint.unresolvedConflicts.filter((file) => !report.applied.includes(file)),
-                ...conflicts
-              ])
-            ];
-            const summary = conflicts.length
-              ? `Integration paused for ${conflicts.length} overlapping file${conflicts.length === 1 ? '' : 's'}: ${conflicts.join(', ')}`
-              : `Integrated ${report.applied.length} changed file${report.applied.length === 1 ? '' : 's'}.`;
-            const fileDetails = report.applied.length ? `\nApplied:\n${report.applied.join('\n')}` : '';
-            appendResult(`${worker.label} · ${conflicts.length ? 'INTEGRATION CONFLICT' : 'INTEGRATED'}`, `${summary}${fileDetails}${report.error ? `\n${report.error}` : ''}`);
-            setNodeStatus(worker.id, conflicts.length ? 'INTEGRATION CONFLICT' : 'INTEGRATED', conflicts.length ? 'error' : 'done');
-            runCheckpoint.activeNodeId = '';
-            runCheckpoint.progress = `${stage} · ${worker.label} ${conflicts.length ? 'has conflicts' : 'integrated'}`;
+          } else {
+            runCheckpoint.completedWorkers = runCheckpoint.completedWorkers.filter((id) => id !== worker.id);
+          }
+          const summary = conflicts.length
+            ? `Integrated ${report.applied.length} non-conflicting file${report.applied.length === 1 ? '' : 's'}; ${conflicts.length} conflict${conflicts.length === 1 ? '' : 's'} remain: ${conflicts.join(', ')}`
+            : `Integrated ${report.applied.length} changed file${report.applied.length === 1 ? '' : 's'}.`;
+          const fileDetails = report.applied.length ? `\nApplied:\n${report.applied.join('\n')}` : '';
+          appendResult(`${worker.label} · ${conflicts.length ? 'INTEGRATION CONFLICT' : 'INTEGRATED'}`, `${summary}${fileDetails}${report.error ? `\n${report.error}` : ''}`);
+          setNodeStatus(worker.id, conflicts.length ? 'INTEGRATION CONFLICT' : 'INTEGRATED', conflicts.length ? 'error' : 'done');
+          runCheckpoint.activeNodeId = '';
+          runCheckpoint.progress = `${stage} · ${worker.label} ${conflicts.length ? 'has conflicts' : 'integrated'}`;
+          await saveRunCheckpoint();
+          if (!conflicts.length) {
+            await call('flow:workspace:dispose', workspace.id);
+            runCheckpoint.workspaceIds = runCheckpoint.workspaceIds.filter((id) => id !== workspace.id);
+            delete runCheckpoint.workspaceByWorker[worker.id];
             await saveRunCheckpoint();
           }
-        } finally {
-          for (const workspace of workspaces) {
-            try {
-              await call('flow:workspace:dispose', workspace.id);
-              runCheckpoint.workspaceIds = runCheckpoint.workspaceIds.filter((id) => id !== workspace.id);
-              await saveRunCheckpoint();
-            } catch (error) {
-              fail(error, 'CLEAN UP WORKER WORKSPACE');
-            }
-          }
         }
+        if (firstFailure) throw firstFailure;
       }
     }
 
@@ -2244,6 +2290,8 @@ export default {
             integrationReports: [],
             unresolvedConflicts: [],
             workspaceIds: [],
+            workspaceByWorker: {},
+            unresolvedConflictOwners: {},
             checksPassed: false,
             clarifications: [],
             values: [[plan.input.id, plan.input.prompt.trim()]],
@@ -2252,6 +2300,7 @@ export default {
             currentRound: 0,
             currentRoundReview: '',
             pendingDecision: null,
+            blockReasons: [],
             nodeStates: {}
           };
           runStates.clear();
@@ -2260,10 +2309,16 @@ export default {
           await saveRunCheckpoint();
           assertRunCurrent(token);
         } else {
-          for (const workspaceId of runCheckpoint.workspaceIds || []) {
-            await call('flow:workspace:dispose', workspaceId);
+          const retainedWorkspaceIds = new Set();
+          for (const [workerId, savedWorkspace] of Object.entries(runCheckpoint.workspaceByWorker || {})) {
+            const available = await call('flow:workspace:get', savedWorkspace.id);
+            if (available && available.root === savedWorkspace.root) retainedWorkspaceIds.add(savedWorkspace.id);
+            else delete runCheckpoint.workspaceByWorker[workerId];
           }
-          runCheckpoint.workspaceIds = [];
+          for (const workspaceId of runCheckpoint.workspaceIds || []) {
+            if (!retainedWorkspaceIds.has(workspaceId)) await call('flow:workspace:dispose', workspaceId);
+          }
+          runCheckpoint.workspaceIds = [...retainedWorkspaceIds];
           runCheckpoint.status = 'running';
           runCheckpoint.resumeMode = true;
           runCheckpoint.lastError = '';
@@ -2482,6 +2537,7 @@ export default {
               .join('\n\n') || 'No worker reports were returned.';
             const roundReview = runCheckpoint.currentRoundReview || 'No reviewer nodes are configured.';
             const canRevise = revisionRoundsUsed < plan.orchestrator.revisionRounds;
+            const gateReasons = Array.isArray(runCheckpoint.blockReasons) ? runCheckpoint.blockReasons : [];
             let decision = runCheckpoint.pendingDecision;
             if (!decision) {
               const decisionPrompt = [
@@ -2497,14 +2553,17 @@ export default {
                 `Current workers:\n${JSON.stringify(workerRosterSummary(), null, 2)}`,
                 `Revision rounds used: ${revisionRoundsUsed}; maximum allowed: ${plan.orchestrator.revisionRounds}.`,
                 `Further revision assignments allowed: ${canRevise ? 'yes' : 'no'}.`,
+                gateReasons.length ? `The previous completion attempt failed these gates:\n${gateReasons.map((reason) => `- ${reason}`).join('\n')}` : '',
                 actionProtocol,
-                canRevise
+                gateReasons.length && canRevise
+                  ? 'The last completion attempt failed its gates. You must request targeted revisions for those failures; do not complete until a later review and check round passes.'
+                  : canRevise
                   ? 'If a specific change or integration conflict remains, request targeted work from one or more current workers. Only finish when every goal meets its acceptance criteria, required checks pass, and conflicts are resolved. Include evidence for every goal.'
                   : 'The revision limit has been reached. Do not request further revisions; report an incomplete result if any goal, check, or integration conflict remains. Include evidence for every goal you can verify.'
               ].join('\n\n');
               decision = await runCoordinator(
                 plan, decisionPrompt, token,
-                canRevise ? ['revise', 'complete'] : ['complete'],
+                gateReasons.length && canRevise ? ['revise'] : canRevise ? ['revise', 'complete'] : ['complete'],
                 `ORCHESTRATE ROUND ${runCheckpoint.currentRound}`,
                 clarifications
               );
@@ -2539,6 +2598,7 @@ export default {
             runCheckpoint.completedWorkers = [];
             runCheckpoint.assignmentContext = feedback;
             runCheckpoint.pendingDecision = decision;
+            runCheckpoint.blockReasons = [];
             await setCheckpointPhase('revision', `Revision ${revisionRoundsUsed}`, token);
             continue;
           }
@@ -2548,6 +2608,16 @@ export default {
             const gate = completionGate(decision);
             runCheckpoint.goalEvidence = gate.evidence;
             if (gate.reasons.length) {
+              const revisionLimit = Number.isInteger(plan.orchestrator.revisionRounds) ? plan.orchestrator.revisionRounds : 0;
+              if (revisionRoundsUsed < revisionLimit) {
+                runCheckpoint.blockReasons = gate.reasons;
+                runCheckpoint.pendingDecision = null;
+                runCheckpoint.phase = 'decision';
+                runCheckpoint.status = 'running';
+                runCheckpoint.progress = 'Completion gates failed · requesting targeted revisions';
+                await saveRunCheckpoint();
+                continue;
+              }
               runCheckpoint.status = 'blocked';
               runCheckpoint.blockReasons = gate.reasons;
               finalText = `BLOCKED · ROADMAP INCOMPLETE\n\n${runCheckpoint.finalText || finalText}\n\nOutstanding completion gates:\n${gate.reasons.map((reason) => `- ${reason}`).join('\n')}`;
@@ -2597,7 +2667,7 @@ export default {
         if (token === runToken) {
           const stopped = cancelled || /cancel|abort/i.test(String(error.message || error));
           runStatus.textContent = stopped ? 'STOPPED' : 'FAILED';
-          managerSummary.textContent = stopped ? 'Run stopped. Completed integrations are preserved; unfinished worker snapshots are discarded.' : `Run failed: ${error.message || error}`;
+          managerSummary.textContent = stopped ? 'Run stopped. Completed integrations are preserved; unfinished assignments can resume from their saved workspaces.' : `Run failed: ${error.message || error}`;
           if (runCheckpoint) {
             runCheckpoint.status = stopped ? 'stopped' : 'failed';
             runCheckpoint.progress = `${runCheckpoint.progress || runCheckpoint.phase}${stopped ? ' · stopped' : ' · failed'}`;

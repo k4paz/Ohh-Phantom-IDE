@@ -136,6 +136,7 @@ public static class PhantomAltTabHook
             else if (up && key == VK_LWIN) leftWindowsKeyDown = false;
             else if (down && key == VK_RWIN) rightWindowsKeyDown = true;
             else if (up && key == VK_RWIN) rightWindowsKeyDown = false;
+            if (key == VK_LWIN || key == VK_RWIN) return new IntPtr(1);
 
             if (down && key == VK_F12 && IsDown(VK_CONTROL) && IsDown(VK_SHIFT))
             {
