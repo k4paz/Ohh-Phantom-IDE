@@ -37,7 +37,7 @@ export default {
         row('Boot sequence', toggle('boot'), 'show the startup diagnostics screen'),
         h('div.hdr', 'WINDOW MANAGER'),
         row('Snap to screen edges', toggle('snap'), 'drag to edges / corners; Ctrl+Alt+arrows'),
-        row('Magnetic alignment', range('magnet', 0, 24, 1, (v) => (v ? v + 'px' : 'off')), 'hold Alt while dragging to bypass'),
+        row('Magnetic alignment', range('magnet', 0, 24, 1, (v) => (v ? v + 'px' : 'off')), 'Ctrl+drag to enable; Alt bypasses'),
         h('div.hdr', 'EDITOR'),
         row('Font size', range('editorFontSize', 10, 22, 1, (v) => v + 'px')),
         row('Tab size', range('tabSize', 2, 8, 1)),

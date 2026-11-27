@@ -24,7 +24,23 @@ function toggleFullscreen() {
 
 function resetDesktopView() {
   wm.exitOverview();
+  const previousViewport = { ...wm.viewport };
   wm.setViewportTransform(1, 0, 0);
+  wm.recordViewportUndo(previousViewport);
+  wm.changed('viewport');
+}
+
+function frameWindow(win) {
+  wm.exitOverview();
+  wm.restore(win);
+  wm.focus(win);
+  const rect = win.max ? wm.viewRect() : win.rect;
+  const previousViewport = { ...wm.viewport };
+  const zoom = Math.max(0.05, Math.min(1, (wm.W - 48) / rect.w, (wm.H - 48) / rect.h));
+  const panX = (wm.W - rect.w * zoom) / 2 - rect.x * zoom;
+  const panY = (wm.H - rect.h * zoom) / 2 - rect.y * zoom;
+  wm.setViewportTransform(zoom, panX, panY);
+  wm.recordViewportUndo(previousViewport);
   wm.changed('viewport');
 }
 
@@ -135,7 +151,7 @@ export function commands() {
     { group: 'window', label: 'Duplicate focused window', icon: 'layout', key: 'Ctrl+Shift+D', run: () => wm.focused && wm.duplicate(wm.focused) },
     { group: 'window', label: 'Close all other windows', icon: 'close', key: 'Ctrl+Shift+R', run: () => wm.focused && wm.closeOthers(wm.focused) },
     { group: 'window', label: 'Close all windows in this workspace', icon: 'close', run: async () => { for (const w of [...wm.windows]) if (w.ws === wm.active) await wm.close(w); } },
-    { group: 'window', label: 'Toggle always-on-top for focused window', icon: 'pin', run: () => wm.focused && wm.setPinned(wm.focused, !wm.focused.pinned) },
+    { group: 'window', label: 'Toggle always-on-screen for focused window', icon: 'pin', run: () => wm.focused && wm.setPinned(wm.focused, !wm.focused.pinned) },
     ...[0, 1, 2, 3].map((i) => ({ group: 'window', label: `Switch to workspace ${i + 1}`, icon: 'layout', key: `Ctrl+Shift+${i + 1}`, run: () => wm.switchWorkspace(i) })),
     { group: 'layout', label: 'Save layout as…', icon: 'save', key: 'Ctrl+Shift+L', run: saveLayoutAs },
     ...Object.keys(PRESETS).map((n) => ({ group: 'layout', label: `Preset: ${n}`, icon: 'layout', run: () => applyPreset(n) })),
@@ -237,7 +253,7 @@ function buildTopbar() {
       { label: 'Magnetic alignment', check: settings.magnet > 0, action: () => setSetting('magnet', settings.magnet > 0 ? 0 : 10) },
       '-',
       { header: 'WINDOWS' },
-      ...wm.windows.filter((w) => w.ws === wm.active).map((w) => ({ label: w.title + (w.sub ? ' — ' + w.sub.slice(-30) : ''), check: w === wm.focused, action: () => { wm.restore(w); wm.focus(w); } }))
+      ...wm.windows.filter((w) => w.ws === wm.active || w.pinned).map((w) => ({ label: w.title + (w.sub ? ' — ' + w.sub.slice(-30) : ''), check: w === wm.focused, action: () => { if (w.ws !== wm.active && !w.pinned) wm.switchWorkspace(w.ws); wm.restore(w); wm.focus(w); } }))
     ],
     LAYOUT: async () => {
       const l = await layouts();
@@ -318,7 +334,7 @@ function buildDock() {
       const app = wm.apps.get(id); if (!app) continue;
       const b = h('button', { 'data-app': id, html: icon(app.icon) + '<span class="n"></span>' });
       b.addEventListener('click', (e) => {
-        const existing = wm.ofApp(id).filter((w) => w.ws === wm.active);
+        const existing = wm.ofApp(id).filter((w) => w.ws === wm.active || w.pinned);
         if (e.shiftKey || !existing.length || app.singleton) wm.open(id);
         else { const w = wm.recent(id); if (w.min) wm.restore(w); if (w === wm.focused && !e.altKey) wm.open(id); else wm.focus(w); }
       });
@@ -326,7 +342,7 @@ function buildDock() {
         e.preventDefault();
         const wins = wm.ofApp(id);
         menu(e.clientX, e.clientY, [{ header: app.title }, { label: 'New window', action: () => wm.open(id) },
-          ...(wins.length ? ['-', ...wins.map((w) => ({ label: `${w.title}${w.sub ? ' · ' + w.sub.slice(-28) : ''}  [ws ${w.ws + 1}]`, action: () => { wm.switchWorkspace(w.ws); wm.restore(w); wm.focus(w); } })), '-', { label: `Close all (${wins.length})`, danger: true, action: () => wins.forEach((w) => wm.close(w)) }] : [])]);
+          ...(wins.length ? ['-', ...wins.map((w) => ({ label: `${w.title}${w.sub ? ' · ' + w.sub.slice(-28) : ''}  [ws ${w.ws + 1}]`, action: () => { if (w.ws !== wm.active && !w.pinned) wm.switchWorkspace(w.ws); wm.restore(w); wm.focus(w); } })), '-', { label: `Close all (${wins.length})`, danger: true, action: () => wins.forEach((w) => wm.close(w)) }] : [])]);
       });
       tooltip(b, app.title, app.key || '');
       dock.appendChild(b);
@@ -353,12 +369,13 @@ function buildTaskbar() {
   const status = h('div.status');
   bar.append(h('button.start', { html: icon('logo') + ' LAUNCH', on: { click: commandPalette } }), tasks, status);
   const render = () => {
-    const list = wm.windows.filter((w) => w.ws === wm.active).sort((a, b) => a.id - b.id);
+    const list = wm.windows.filter((w) => w.ws === wm.active || w.pinned).sort((a, b) => a.id - b.id);
     tasks.innerHTML = '';
     for (const [index, w] of list.entries()) {
       const shortcut = index < 9 ? ` · Shift+${index + 1} (double-press resets desktop)` : '';
-      const b = h('button.task' + (w === wm.focused ? '.focus' : '') + (w.min ? '.min' : ''), { 'data-win': w.id, title: `${w.title}${w.sub ? ' — ' + w.sub : ''}${shortcut}`, html: `${icon(w.app.icon)}<span>${esc(w.title)}${w.sub ? ' <span class="c-dim">' + esc(basename(w.sub)) + '</span>' : ''}</span>${w.pinned ? '<span class="pin">▲</span>' : ''}` });
+      const b = h('button.task' + (w === wm.focused ? '.focus' : '') + (w.min ? '.min' : ''), { 'data-win': w.id, title: `${w.title}${w.sub ? ' — ' + w.sub : ''}${shortcut} · Double-click to frame window`, html: `${icon(w.app.icon)}<span>${esc(w.title)}${w.sub ? ' <span class="c-dim">' + esc(basename(w.sub)) + '</span>' : ''}</span>${w.pinned ? '<span class="pin">▲</span>' : ''}` });
       b.addEventListener('click', () => { if (w === wm.focused && !w.min) wm.minimize(w); else { wm.restore(w); wm.focus(w); } });
+      b.addEventListener('dblclick', (event) => { event.preventDefault(); frameWindow(w); });
       b.addEventListener('auxclick', (e) => { if (e.button === 1) wm.close(w); });
       b.addEventListener('contextmenu', (e) => { e.preventDefault(); wm.windowMenu(w, e.clientX, e.clientY - 300); });
       tasks.appendChild(b);
@@ -430,9 +447,13 @@ function buildWallpaper() {
     if (!panDrag || panDrag.pointerId !== event.pointerId) return;
     suppressContextMenu = panDrag.button === 2 && panDrag.moved;
     const moved = panDrag.moved;
+    const previousViewport = { zoom: wm.viewport.zoom, panX: panDrag.panX, panY: panDrag.panY };
     panDrag = null;
     desktop.classList.remove('wallpaper-panning');
-    if (moved) wm.changed('viewport');
+    if (moved) {
+      wm.recordViewportUndo(previousViewport);
+      wm.changed('viewport');
+    }
     if (suppressContextMenu) setTimeout(() => { suppressContextMenu = false; }, 350);
   };
   window.addEventListener('pointerup', finishPan);
@@ -468,8 +489,20 @@ function keybindings() {
     const ctrl = e.ctrlKey || e.metaKey; const k = e.key;
     const digit = Number(/^(?:Digit|Numpad)([1-9])$/.exec(e.code)?.[1] || (/^[1-9]$/.test(k) ? k : 0));
     const f = wm.focused;
+    const target = e.target instanceof Element ? e.target : null;
+    const editingText = target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], .monaco-editor, .xterm');
     const stop = () => { e.preventDefault(); e.stopPropagation(); };
-    if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && (k === 'Tab' || e.code === 'Tab')) {
+    if (ctrl && !e.shiftKey && !e.altKey && (k === 'z' || k === 'Z') && !editingText && wm.canUndoClose()) {
+      stop();
+      wm.undoClose().catch((error) => fail(error, 'UNDO CLOSE'));
+    }
+    else if (ctrl && e.shiftKey && !e.altKey && (k === 'z' || k === 'Z') && wm.redoViewport()) {
+      stop();
+    }
+    else if (ctrl && !e.shiftKey && !e.altKey && (k === 'z' || k === 'Z') && wm.undoViewport()) {
+      stop();
+    }
+    else if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && (k === 'Tab' || e.code === 'Tab')) {
       stop();
       if (!e.repeat) wm.toggleOverview();
     }
