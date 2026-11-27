@@ -8,6 +8,8 @@ const TITLE_H = 24;
 const WORKSPACES = 4;
 const EDGE = 8; // px from desktop edge that triggers snap zones
 const CORNER = 48;
+const MAX_VIEWPORT_HISTORY = 50;
+const MAX_CLOSED_WINDOWS = 20;
 
 let nextId = 1;
 
@@ -24,7 +26,7 @@ class Win {
   }
   build() {
     const ctrl = h('div.pw-ctrl',
-      this.pinBtn = h('button.pin', { title: 'Always on top', html: icon('pin'), on: { click: () => this.wm.setPinned(this, !this.pinned) } }),
+      this.pinBtn = h('button.pin', { title: 'Keep on screen across workspaces', 'aria-label': 'Keep on screen across workspaces', 'aria-pressed': String(this.pinned), html: icon('pin'), on: { click: () => this.wm.setPinned(this, !this.pinned) } }),
       h('button.minb', { title: 'Minimize', html: icon('min'), on: { click: () => this.wm.minimize(this) } }),
       this.maxBtn = h('button.maxb', { title: 'Maximize', html: icon('max'), on: { click: () => this.wm.toggleMax(this) } }),
       h('button.close', { title: 'Close', html: icon('close'), on: { click: () => this.wm.close(this) } })
@@ -40,10 +42,31 @@ class Win {
     this.sizeEl = h('div.pw-size');
     this.el = h('div.pw', { 'data-app': this.app.id }, this.titleEl, this.body, this.sizeEl,
       ...['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'].map((d) => h('div.pw-rz.' + d, { 'data-dir': d })));
-    this.el.addEventListener('pointerdown', () => this.wm.focus(this), true);
+    this.el.addEventListener('pointerdown', (e) => {
+      if (this.wm.overviewState) { e.stopImmediatePropagation(); return; }
+      this.wm.focus(this);
+    }, true);
+    this.el.addEventListener('click', (e) => {
+      if (!this.wm.overviewState && e.detail > 1 && this.wm.overviewClickGuard?.win === this && performance.now() < this.wm.overviewClickGuard.until) {
+        e.preventDefault(); e.stopImmediatePropagation();
+        return;
+      }
+      if (!this.wm.overviewState) return;
+      e.preventDefault(); e.stopImmediatePropagation();
+      this.wm.selectOverviewWindow(this);
+    }, true);
     this.titleEl.addEventListener('pointerdown', (e) => { if (e.button === 0 && !e.target.closest('button')) this.wm.beginDrag(this, e); });
-    this.titleEl.addEventListener('dblclick', (e) => { if (!e.target.closest('button')) this.wm.toggleMax(this); });
-    this.titleEl.addEventListener('contextmenu', (e) => { e.preventDefault(); this.wm.windowMenu(this, e.clientX, e.clientY); });
+    this.titleEl.addEventListener('dblclick', (e) => {
+      if (this.wm.overviewState || (this.wm.overviewClickGuard?.win === this && performance.now() < this.wm.overviewClickGuard.until)) {
+        e.preventDefault(); e.stopImmediatePropagation();
+        return;
+      }
+      if (!e.target.closest('button')) this.wm.toggleMax(this);
+    });
+    this.titleEl.addEventListener('contextmenu', (e) => {
+      if (this.wm.overviewState) { e.preventDefault(); e.stopImmediatePropagation(); return; }
+      e.preventDefault(); this.wm.windowMenu(this, e.clientX, e.clientY);
+    });
     this.titleEl.addEventListener('auxclick', (e) => { if (e.button === 1) this.wm.close(this); });
     for (const rz of this.el.querySelectorAll('.pw-rz')) rz.addEventListener('pointerdown', (e) => { if (e.button === 0) this.wm.beginResize(this, e, rz.dataset.dir); });
     let raf = 0;
@@ -55,7 +78,7 @@ class Win {
   setTitle(text) { this.title = text || this.app.title; this.nameEl.textContent = this.title; this.wm.changed('meta'); }
   setBadge(text) { this.badgeEl.textContent = text || ''; }
   onResize(fn) { this.resizeFns.add(fn); return () => this.resizeFns.delete(fn); }
-  get visible() { return !this.min && this.ws === this.wm.active && !this.closed; }
+  get visible() { return !this.min && (this.pinned || this.ws === this.wm.active) && !this.closed; }
   get focused() { return this.wm.focused === this; }
   close() { return this.wm.close(this); }
   focus() { this.wm.focus(this); }
@@ -69,6 +92,12 @@ export class WindowManager {
     this.cycleOrder = null;
     this.cycling = false;
     this.windowSwitcher = null;
+    this.overviewState = null;
+    this.overviewClickGuard = null;
+    this.viewportHistory = [];
+    this.viewportRedoHistory = [];
+    this.closedWindows = [];
+    this.undoOrder = 0;
     bus.on('wm:changed', () => this.refreshWindowSwitcher());
   }
 
@@ -103,14 +132,102 @@ export class WindowManager {
       y: (clientY - deskRect.top - panY) / zoom
     };
   }
-  setViewportTransform(_zoom, panX, panY) {
-    this.viewport = { zoom: 1, panX, panY };
-    this.world.style.transform = `translate(${panX}px, ${panY}px)`;
+  setViewportTransform(zoom, panX, panY) {
+    const scale = Math.min(1, Math.max(0.05, zoom));
+    this.viewport = { zoom: scale, panX, panY };
+    this.world.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
     for (const win of this.windows) {
       if (win.max) this.render(win);
       else if (win.snapZone) { win.rect = this.zoneRect(win.snapZone); this.render(win); }
     }
     bus.emit('wm:viewport', this.viewport);
+  }
+  recordViewportUndo(viewport) {
+    if (viewport.zoom === this.viewport.zoom && viewport.panX === this.viewport.panX && viewport.panY === this.viewport.panY) return;
+    this.viewportHistory.push({ ...viewport, undoOrder: ++this.undoOrder });
+    this.viewportRedoHistory.length = 0;
+    if (this.viewportHistory.length > MAX_VIEWPORT_HISTORY) this.viewportHistory.shift();
+  }
+  canUndoViewport() {
+    const viewport = this.viewportHistory.at(-1);
+    const closed = this.closedWindows.at(-1);
+    return !!viewport && (!closed || viewport.undoOrder > closed.undoOrder);
+  }
+  undoViewport() {
+    if (this.overviewState || !this.canUndoViewport()) return false;
+    const viewport = this.viewportHistory.pop();
+    if (!viewport) return false;
+    this.viewportRedoHistory.push({ ...this.viewport });
+    if (this.viewportRedoHistory.length > MAX_VIEWPORT_HISTORY) this.viewportRedoHistory.shift();
+    this.setViewportTransform(viewport.zoom, viewport.panX, viewport.panY);
+    this.changed('viewport');
+    return true;
+  }
+  redoViewport() {
+    if (this.overviewState) return false;
+    const viewport = this.viewportRedoHistory.pop();
+    if (!viewport) return false;
+    this.viewportHistory.push({ ...this.viewport, undoOrder: ++this.undoOrder });
+    if (this.viewportHistory.length > MAX_VIEWPORT_HISTORY) this.viewportHistory.shift();
+    this.setViewportTransform(viewport.zoom, viewport.panX, viewport.panY);
+    this.changed('viewport');
+    return true;
+  }
+  toggleOverview() {
+    if (this.overviewState) return this.exitOverview();
+    const windows = this.windows.filter((win) => win.visible);
+    if (!windows.length) return;
+
+    const windowStates = new Map(windows.map((win) => [win, {
+      rect: { ...win.rect },
+      max: win.max,
+      snapZone: win.snapZone,
+      restoreRect: win.restoreRect && { ...win.restoreRect }
+    }]));
+    this.overviewState = { viewport: { ...this.viewport }, windows: windowStates };
+    for (const win of windows) {
+      const state = windowStates.get(win);
+      if (state.snapZone && state.restoreRect) win.rect = { ...state.restoreRect };
+      win.max = false;
+      win.snapZone = null;
+      this.render(win);
+      this.sync(win);
+    }
+
+    const bounds = windows.map((win) => win.rect);
+    const left = Math.min(...bounds.map((rect) => rect.x));
+    const top = Math.min(...bounds.map((rect) => rect.y));
+    const right = Math.max(...bounds.map((rect) => rect.x + rect.w));
+    const bottom = Math.max(...bounds.map((rect) => rect.y + rect.h));
+    const width = Math.max(1, right - left);
+    const height = Math.max(1, bottom - top);
+    const zoom = Math.max(0.05, Math.min(1, (this.W - 48) / width, (this.H - 48) / height));
+    const panX = (this.W - width * zoom) / 2 - left * zoom;
+    const panY = (this.H - height * zoom) / 2 - top * zoom;
+    this.setViewportTransform(zoom, panX, panY);
+    this.changed('overview');
+  }
+  exitOverview() {
+    if (!this.overviewState) return;
+    const overview = this.overviewState;
+    this.overviewState = null;
+    this.setViewportTransform(overview.viewport.zoom, overview.viewport.panX, overview.viewport.panY);
+    for (const [win, state] of overview.windows) {
+      if (win.closed) continue;
+      win.max = state.max;
+      win.snapZone = state.snapZone;
+      win.restoreRect = state.restoreRect && { ...state.restoreRect };
+      if (state.snapZone) win.rect = this.zoneRect(state.snapZone);
+      this.render(win);
+      this.sync(win);
+    }
+    this.changed('overview');
+  }
+  selectOverviewWindow(win) {
+    if (!this.overviewState || !win || win.closed) return;
+    this.overviewClickGuard = { win, until: performance.now() + 400 };
+    this.exitOverview();
+    this.focus(win);
   }
 
   // ───────── lifecycle ─────────
@@ -119,7 +236,7 @@ export class WindowManager {
     if (!app) { toast(`unknown tool: ${appId}`, 'error'); return null; }
     if (app.singleton && !opts.allowDuplicate) {
       const ex = this.windows.find((w) => w.app.id === appId);
-      if (ex) { if (ex.ws !== this.active) this.switchWorkspace(ex.ws); this.restore(ex); this.focus(ex); if (opts.state && ex.instance && ex.instance.apply) ex.instance.apply(opts.state); return ex; }
+      if (ex) { if (ex.ws !== this.active && !ex.pinned) this.switchWorkspace(ex.ws); this.restore(ex); this.focus(ex); if (opts.state && ex.instance && ex.instance.apply) ex.instance.apply(opts.state); return ex; }
     }
     const win = new Win(this, app, opts);
     if (opts.rect) win.rect = { ...opts.rect };
@@ -147,11 +264,23 @@ export class WindowManager {
     return win;
   }
 
-  async close(win, force = false) {
+  async close(win, force = false, recordUndo = true) {
     if (win.closed) return true;
     if (!force && win.instance && win.instance.canClose) {
       const ok = await win.instance.canClose();
       if (!ok) return false;
+    }
+    if (recordUndo) {
+      let state = {};
+      try { state = win.instance && win.instance.serialize ? win.instance.serialize() : {}; } catch (e) { console.error(e); }
+      this.closedWindows.push({
+        appId: win.app.id, state, rect: { ...win.rect },
+        restoreRect: win.restoreRect && { ...win.restoreRect },
+        workspace: win.ws, max: win.max, snap: win.snapZone,
+        pinned: win.pinned, title: win.title, undoOrder: ++this.undoOrder
+      });
+      this.viewportRedoHistory.length = 0;
+      if (this.closedWindows.length > MAX_CLOSED_WINDOWS) this.closedWindows.shift();
     }
     win.closed = true;
     try { win.instance && win.instance.destroy && win.instance.destroy(); } catch (e) { console.error(e); }
@@ -165,9 +294,38 @@ export class WindowManager {
     bus.emit('wm:close', win);
     return true;
   }
+  canUndoClose() {
+    const closed = this.closedWindows.at(-1);
+    const viewport = this.viewportHistory.at(-1);
+    return !!closed && (!viewport || closed.undoOrder > viewport.undoOrder);
+  }
+  async undoClose() {
+    if (!this.canUndoClose()) return false;
+    const closed = this.closedWindows.pop();
+    if (!closed) return false;
+    try {
+      if (closed.workspace !== this.active) this.switchWorkspace(closed.workspace);
+      const win = await this.open(closed.appId, {
+        allowDuplicate: true, state: closed.state, rect: closed.rect,
+        workspace: closed.workspace, maximized: closed.max, snap: closed.snap,
+        pinned: closed.pinned, title: closed.title
+      });
+      if (!win) {
+        this.closedWindows.push(closed);
+        return false;
+      }
+      win.restoreRect = closed.restoreRect && { ...closed.restoreRect };
+      this.restore(win);
+      this.focus(win);
+      return true;
+    } catch (error) {
+      this.closedWindows.push(closed);
+      throw error;
+    }
+  }
 
   async closeAll(ws = null) {
-    for (const w of [...this.windows]) if (ws === null || w.ws === ws) if (!(await this.close(w))) return false;
+    for (const w of [...this.windows]) if (ws === null || w.ws === ws) if (!(await this.close(w, false, false))) return false;
     return true;
   }
 
@@ -175,7 +333,7 @@ export class WindowManager {
     if (!keep || keep.closed) return false;
     for (const win of [...this.windows]) {
       if (win === keep) continue;
-      if (!(await this.close(win))) {
+      if (!(await this.close(win, false, false))) {
         toast(`Could not close "${win.title}".`, 'warn', 'WINDOWS');
         return false;
       }
@@ -255,7 +413,7 @@ export class WindowManager {
     const list = this.history.filter((w) => w.app.id === appId && !w.closed).reverse();
     const rest = this.windows.filter((w) => w.app.id === appId && !list.includes(w)).sort((a, b) => b.z - a.z);
     const all = [...list, ...rest];
-    return all.find((w) => w.ws === this.active && !w.min) || all.find((w) => w.ws === this.active) || all[0] || null;
+    return all.find((w) => w.ws === this.active && !w.min) || all.find((w) => w.pinned && !w.min) || all.find((w) => w.ws === this.active) || all[0] || null;
   }
   ofApp(appId) { return this.windows.filter((w) => w.app.id === appId); }
 
@@ -289,10 +447,13 @@ export class WindowManager {
   }
   toggleMax(win) { win.max ? this.unmaximize(win) : this.maximize(win); }
   setPinned(win, v) {
+    if (!v && win.ws !== this.active) this.switchWorkspace(win.ws);
     win.pinned = v;
     win.pinBtn.classList.toggle('on', v); win.el.classList.toggle('pinned', v);
+    win.pinBtn.setAttribute('aria-pressed', String(v));
+    this.sync(win);
     this.stack(win); this.changed('pin');
-    toast(v ? `${win.title}: always on top` : `${win.title}: normal stacking`, 'info', 'WINDOW', 1500);
+    toast(v ? `${win.title}: always on screen` : `${win.title}: current workspace only`, 'info', 'WINDOW', 1500);
   }
   animate(win) {
     if (settings.reduceMotion) return;
@@ -326,6 +487,7 @@ export class WindowManager {
   // ───────── workspaces ─────────
   switchWorkspace(i) {
     if (i === this.active || i < 0 || i >= WORKSPACES) return;
+    this.exitOverview();
     this.active = i;
     for (const w of this.windows) this.sync(w);
     this.focusTop();
@@ -504,7 +666,7 @@ export class WindowManager {
     const selected = this.windowSwitcher.windows[this.windowSwitcher.selectedIndex];
     this.closeWindowSwitcher();
     if (!selected || selected.closed) return;
-    if (selected.ws !== this.active) this.switchWorkspace(selected.ws);
+    if (selected.ws !== this.active && !selected.pinned) this.switchWorkspace(selected.ws);
     this.restore(selected);
     this.focus(selected);
   }
@@ -614,17 +776,15 @@ export class WindowManager {
         lockedGuideX = null;
         lockedGuideY = null;
       }
-      if (settings.magnet > 0 && !ev.altKey) {
+      if (settings.magnet > 0 && hardLock) {
         const { xs, ys } = this.magnetEdges(win);
         const threshold = settings.magnet / this.viewport.zoom;
         const mx = this.snapAxis(x, x + r0.w, xs, threshold);
         const my = this.snapAxis(y, y + r0.h, ys, threshold);
-        if (hardLock && !lockedGuideX && mx) lockedGuideX = { at: mx.at, offset: mx.offset };
-        if (hardLock && !lockedGuideY && my) lockedGuideY = { at: my.at, offset: my.offset };
-        if (hardLock && lockedGuideX) { x = lockedGuideX.at - lockedGuideX.offset; gx = lockedGuideX.at; }
-        else if (mx) { x += mx.delta; gx = mx.at; }
-        if (hardLock && lockedGuideY) { y = lockedGuideY.at - lockedGuideY.offset; gy = lockedGuideY.at; }
-        else if (my) { y += my.delta; gy = my.at; }
+        if (!lockedGuideX && mx) lockedGuideX = { at: mx.at, offset: mx.offset };
+        if (!lockedGuideY && my) lockedGuideY = { at: my.at, offset: my.offset };
+        if (lockedGuideX) { x = lockedGuideX.at - lockedGuideX.offset; gx = lockedGuideX.at; }
+        if (lockedGuideY) { y = lockedGuideY.at - lockedGuideY.offset; gy = lockedGuideY.at; }
       }
       const view = this.viewRect();
       y = Math.max(view.y, Math.min(y, view.y + view.h - TITLE_H / this.viewport.zoom));
@@ -632,7 +792,7 @@ export class WindowManager {
       win.rect = { x: Math.round(x), y: Math.round(y), w: r0.w, h: r0.h };
       this.render(win);
       this.showGuides(gx, gy);
-      zone = ev.altKey ? null : this.detectZone(ev.clientX - deskR.left, ev.clientY - deskR.top);
+      zone = ev.ctrlKey || ev.altKey ? null : this.detectZone(ev.clientX - deskR.left, ev.clientY - deskR.top);
       this.showPreview(zone);
     };
     const up = () => {
@@ -703,7 +863,7 @@ export class WindowManager {
     for (let i = 0; i < WORKSPACES; i++) wsItems.push({ label: `Move to workspace ${i + 1}`, check: win.ws === i, action: () => this.moveToWorkspace(win, i), key: `⇧⌥${i + 1}` });
     menu(x, y, [
       { header: win.title },
-      { label: 'Always on top', check: win.pinned, action: () => this.setPinned(win, !win.pinned) },
+      { label: 'Always on screen', check: win.pinned, action: () => this.setPinned(win, !win.pinned) },
       { label: win.max ? 'Restore' : 'Maximize', action: () => this.toggleMax(win), key: 'Win+↑' },
       { label: 'Minimize', action: () => this.minimize(win), key: 'Win+↓' },
       '-',
@@ -732,17 +892,27 @@ export class WindowManager {
 
   // ───────── persistence ─────────
   serialize() {
+    const viewport = this.overviewState?.viewport || this.viewport;
     return {
-      v: 1, active: this.active, desk: { w: this.W, h: this.H }, viewport: { ...this.viewport },
+      v: 1, active: this.active, desk: { w: this.W, h: this.H }, viewport: { ...viewport },
       windows: [...this.windows].sort((a, b) => a.z - b.z).map((w) => {
         let state = {};
         try { state = w.instance && w.instance.serialize ? w.instance.serialize() : {}; } catch (e) { console.error(e); }
-        return { app: w.app.id, ws: w.ws, rect: w.rect, restoreRect: w.restoreRect, min: w.min, max: w.max, pinned: w.pinned, snap: w.snapZone, title: w.title !== w.app.title ? w.title : undefined, state, focused: w === this.focused };
+        const overview = this.overviewState?.windows.get(w);
+        const rect = overview && (overview.max || overview.snapZone) ? overview.rect : w.rect;
+        return {
+          app: w.app.id, ws: w.ws, rect,
+          restoreRect: overview ? overview.restoreRect : w.restoreRect,
+          min: w.min, max: overview ? overview.max : w.max, pinned: w.pinned,
+          snap: overview ? overview.snapZone : w.snapZone,
+          title: w.title !== w.app.title ? w.title : undefined, state, focused: w === this.focused
+        };
       })
     };
   }
   async restoreLayout(layout, { replace = true } = {}) {
     if (!layout || !Array.isArray(layout.windows)) return;
+    this.exitOverview();
     if (replace && !(await this.closeAll())) return;
     const sx = layout.desk && layout.desk.w ? this.W / layout.desk.w : 1;
     const sy = layout.desk && layout.desk.h ? this.H / layout.desk.h : 1;
