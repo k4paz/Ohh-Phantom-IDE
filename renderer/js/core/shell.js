@@ -15,7 +15,7 @@ export const DOCK = [
   ['debug', 'tests', 'build'],
   ['api', 'db', 'json', 'markdown'],
   ['sysmon', 'net', 'procs', 'logs', 'events'],
-  ['collab', 'ssh', 'audit', 'arch', 'agents', 'flow']
+  ['collab', 'ssh', 'audit', 'arch']
 ];
 
 function toggleFullscreen() {

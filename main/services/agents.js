@@ -7,6 +7,8 @@ const { randomUUID } = require('crypto');
 const { spawn, execFile } = require('child_process');
 const { which, readJson, writeJsonAtomic } = require('../util');
 const { getAgentCapacity } = require('./flow-capacity');
+const { createRuntime } = require('../agent-runtime');
+const { createPlatform } = require('../agent-platform');
 
 const COPILOT_SEND_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -109,7 +111,8 @@ function agentOptions(provider, value) {
   const efforts = {
     copilot: ['low', 'medium', 'high', 'xhigh', 'max'],
     codex: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent'],
-    claude: ['low', 'medium', 'high', 'xhigh', 'max']
+    claude: ['low', 'medium', 'high', 'xhigh', 'max'],
+    local: ['minimal', 'low', 'medium', 'high']
   };
   const reasoningEffort = value.reasoningEffort || '';
   if (reasoningEffort && !efforts[provider].includes(reasoningEffort)) throw new Error(`Unsupported reasoning effort for ${provider}.`);
@@ -237,14 +240,16 @@ function fetchCopilotQuota() {
 module.exports = (core) => {
   const conversations = new Map();
   const pendingApprovals = new Map();
+  const runtime = createRuntime(core);
+  const platform = createPlatform(core);
   let creatingConversations = 0;
   const accountStateFile = path.join(core.dataDir, 'agent-accounts.json');
   let accountWrites = Promise.resolve();
 
   const emptyAccountState = () => ({
-    profiles: { copilot: [], codex: [], claude: [] },
-    active: { copilot: 'default', codex: 'default', claude: 'default' },
-    usage: { copilot: {}, codex: {}, claude: {} }
+    profiles: { copilot: [], codex: [], claude: [], local: [] },
+    active: { copilot: 'default', codex: 'default', claude: 'default', local: 'default' },
+    usage: { copilot: {}, codex: {}, claude: {}, local: {} }
   });
 
   async function readAccountState() {
@@ -299,6 +304,7 @@ module.exports = (core) => {
 
   function accountEnvironment(provider, id) {
     if (id === 'default') return {};
+    if (provider === 'local') return {};
     const directory = accountDirectory(provider, id);
     if (provider === 'copilot') return { COPILOT_HOME: directory };
     if (provider === 'codex') return { CODEX_HOME: directory };
@@ -321,7 +327,7 @@ module.exports = (core) => {
   }
 
   function requireProvider(provider) {
-    if (!['copilot', 'codex', 'claude'].includes(provider)) throw new Error('Unsupported agent provider.');
+    if (!['copilot', 'codex', 'claude', 'local'].includes(provider)) throw new Error('Unsupported agent provider.');
     return provider;
   }
 
@@ -336,11 +342,53 @@ module.exports = (core) => {
     if (conversations.has(conversationId)) core.emit('agent:event', { conversationId, ...event });
   }
 
-  function requestPermission(conversationId, request) {
+  async function requestPermission(conversationId, request) {
+    const conversation = conversations.get(conversationId);
+    const runId = conversation?.runId;
+    const action = request?.kind === 'shell' ? 'send'
+      : request?.kind === 'url' ? 'network'
+      : request?.kind === 'write' ? 'write'
+      : request?.kind === 'read' ? 'read'
+      : 'send';
+    let permission = null;
+    if (runId) {
+      permission = await runtime.recordPermissionDecision(runId, {
+        turn: conversation.turn || 1,
+        role: 'worker',
+        tool: action === 'write' ? 'write_file' : action === 'read' ? 'read_file' : 'summarize',
+        action,
+        provider: conversation.provider
+      });
+    }
+    if (permission?.decision === 'deny') {
+      return { kind: 'reject', feedback: permission.reason };
+    }
     const approvalId = randomUUID();
+    if (runId) {
+      await runtime.recordApproval(runId, {
+        id: approvalId,
+        turn: conversation.turn || 1,
+        provider: conversation.provider,
+        tool: action,
+        arguments: request,
+        riskSummary: `Allow ${action} action requested by the ${conversation.provider} agent?`
+      });
+    }
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         pendingApprovals.delete(approvalId);
+        if (runId) {
+          runtime.recordApproval(runId, {
+            id: approvalId,
+            turn: conversation.turn || 1,
+            provider: conversation.provider,
+            tool: action,
+            arguments: request,
+            riskSummary: 'Permission request expired before a human decision.',
+            outcome: 'expired',
+            actor: 'system'
+          }).catch((error) => core.log('error', `approval audit failed: ${error.message}`, 'AGENTS'));
+        }
         resolve({ kind: 'reject', feedback: 'Permission request timed out.' });
       }, 5 * 60 * 1000);
       pendingApprovals.set(approvalId, { conversationId, resolve, timer });
@@ -400,11 +448,14 @@ module.exports = (core) => {
       });
       const conversation = {
         id, provider: 'copilot', cwd, client, session, busy: false,
-        accountId: options.accountId, currentUsage: null
+        accountId: options.accountId, currentUsage: null, runId: options.runId, turn: 0
       };
       session.on('assistant.message_delta', (event) => {
         const text = event.data.deltaContent || '';
-        if (conversation.currentUsage) conversation.currentUsage.outputChars += text.length;
+        if (conversation.currentUsage) {
+          conversation.currentUsage.outputChars += text.length;
+          conversation.currentUsage.outputText += text;
+        }
         emit(id, { type: 'delta', text });
       });
       return conversation;
@@ -454,7 +505,7 @@ module.exports = (core) => {
     });
     return {
       id, provider: 'codex', cwd, thread, busy: false, controller: null,
-      accountId: options.accountId, currentUsage: null
+      accountId: options.accountId, currentUsage: null, runId: options.runId, turn: 0
     };
   }
 
@@ -531,7 +582,10 @@ module.exports = (core) => {
           return;
         }
         output += chunk;
-        if (conversation.currentUsage) conversation.currentUsage.outputChars += chunk.length;
+        if (conversation.currentUsage) {
+          conversation.currentUsage.outputChars += chunk.length;
+          conversation.currentUsage.outputText += chunk;
+        }
         emit(conversation.id, { type: 'delta', text: chunk });
       });
       child.stderr.on('data', (chunk) => {
@@ -559,10 +613,20 @@ module.exports = (core) => {
           if (sizes) {
             sizes.set(itemId, Math.max(sizes.get(itemId) || 0, text.length));
             conversation.currentUsage.outputChars = [...sizes.values()].reduce((total, size) => total + size, 0);
+            conversation.currentUsage.outputText = text;
           }
           emit(conversation.id, { type: 'replace', text });
         }
-        else if (event.item.type === 'command_execution') emit(conversation.id, { type: 'activity', text: event.item.command });
+        else if (event.item.type === 'command_execution') {
+          emit(conversation.id, { type: 'activity', text: event.item.command });
+          await runtime.addToolCall(conversation.runId, {
+            turn: conversation.turn,
+            tool: 'run_tests',
+            arguments: { command: event.item.command },
+            outcome: event.item.status === 'failed' ? 'failed' : 'success',
+            latencyMs: 0
+          }).catch((error) => core.log('error', `tool audit failed: ${error.message}`, 'AGENTS'));
+        }
       } else if (event.type === 'turn.failed' || event.type === 'error') {
         throw new Error(event.error?.message || event.message || 'Codex turn failed.');
       } else if (event.type === 'turn.completed' && conversation.currentUsage && event.usage) {
@@ -581,6 +645,7 @@ module.exports = (core) => {
     const conversation = conversations.get(id);
     if (!conversation) return false;
     conversations.delete(id);
+    if (conversation.runId) await runtime.setStatus(conversation.runId, 'cancelled');
     for (const [approvalId, approval] of pendingApprovals) {
       if (approval.conversationId !== id) continue;
       clearTimeout(approval.timer);
@@ -693,16 +758,47 @@ module.exports = (core) => {
         options.accountId = requestedAccountId;
         const accountEnv = accountEnvironment(provider, requestedAccountId);
         const id = randomUUID();
+        const run = await runtime.createRun({
+          provider,
+          cwd,
+          accountId: requestedAccountId,
+          role: 'worker',
+          config: {
+            model: options.model,
+            reasoningEffort: options.reasoningEffort,
+            webSearchMode: options.webSearchMode,
+            agentMode: options.agentMode,
+            permissionMode: options.permissionMode,
+            enableMcp: options.enableMcp,
+            budgetUsdPerRun: provider === 'copilot' ? 2 : provider === 'codex' ? 3 : 5
+          }
+        });
+        options.runId = run.id;
+        if (Array.isArray(optionsValue?.previousContext)) {
+          for (const [index, entry] of optionsValue.previousContext.slice(-100).entries()) {
+            if (!entry || typeof entry.text !== 'string') continue;
+            await runtime.appendTurn(run.id, {
+              turn: 0,
+              role: entry.role === 'assistant' ? 'worker' : 'user',
+              provider: typeof entry.provider === 'string' ? entry.provider : provider,
+              content: entry.text,
+              usage: { tokensIn: 0, tokensOut: 0, costUsd: 0 }
+            });
+          }
+        }
         const conversation = provider === 'copilot'
           ? await createCopilotConversation(id, cwd, options, accountEnv)
           : provider === 'codex'
             ? await createCodexConversation(id, cwd, options, accountEnv)
-            : {
+            : provider === 'local'
+              ? { id, provider: 'local', cwd, options, busy: false, controller: null,
+                  accountId: options.accountId, accountEnv, currentUsage: null, runId: run.id, turn: 0 }
+              : {
               id, provider: 'claude', cwd, options, busy: false, proc: null, cancelled: false,
-              accountId: options.accountId, accountEnv, currentUsage: null
+              accountId: options.accountId, accountEnv, currentUsage: null, runId: options.runId, turn: 0
             };
         conversations.set(id, conversation);
-        return { id, cwd, provider };
+        return { id, cwd, provider, runId: run.id };
       } finally {
         creatingConversations--;
       }
@@ -712,10 +808,13 @@ module.exports = (core) => {
       if (!conversation) throw new Error('Agent chat is no longer available.');
       if (conversation.busy) throw new Error('Wait for the current agent response to finish.');
       if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 20000) throw new Error('Enter a prompt under 20,000 characters.');
+      await runtime.checkBudget(conversation.runId);
       conversation.busy = true;
+      conversation.turn = (conversation.turn || 0) + 1;
       conversation.currentUsage = {
         inputChars: prompt.trim().length,
         outputChars: 0,
+        outputText: '',
         reportedInputTokens: 0,
         reportedOutputTokens: 0,
         reportedTokenTurns: 0,
@@ -723,13 +822,44 @@ module.exports = (core) => {
       };
       emit(id, { type: 'started' });
       try {
+        await runtime.appendTurn(conversation.runId, {
+          turn: conversation.turn,
+          role: 'worker',
+          provider: conversation.provider,
+          content: prompt.trim(),
+          usage: { tokensIn: 0, tokensOut: 0, costUsd: 0 }
+        });
         if (conversation.provider === 'copilot') {
           await conversation.session.sendAndWait({ prompt: prompt.trim() }, COPILOT_SEND_TIMEOUT_MS);
         } else if (conversation.provider === 'codex') {
           await runCodex(conversation, prompt.trim());
+        } else if (conversation.provider === 'claude') {
+          conversation.currentUsage.outputText = await runClaude(conversation, prompt.trim());
         } else {
-          await runClaude(conversation, prompt.trim());
+          const controller = new AbortController();
+          conversation.controller = controller;
+          const local = await platform.runLocalModel({ prompt: prompt.trim(), signal: controller.signal });
+          conversation.currentUsage.outputText = local.output;
+          conversation.currentUsage.outputChars = local.output.length;
+          emit(id, { type: 'replace', text: local.output });
         }
+        const turn = conversation.currentUsage;
+        await runtime.appendTurn(conversation.runId, {
+          turn: conversation.turn,
+          role: 'worker',
+          provider: conversation.provider,
+          content: turn.outputText || 'Done.',
+          usage: {
+            tokensIn: Number(turn.reportedInputTokens) || 0,
+            tokensOut: Number(turn.reportedOutputTokens) || 0,
+            costUsd: 0
+          },
+          toolCalls: []
+        });
+        await runtime.setStatus(conversation.runId, 'active');
+      } catch (error) {
+        await runtime.setStatus(conversation.runId, 'failed', error.message);
+        throw error;
       } finally {
         const turn = conversation.currentUsage;
         conversation.currentUsage = null;
@@ -762,6 +892,19 @@ module.exports = (core) => {
       if (!approval) return false;
       pendingApprovals.delete(approvalId);
       clearTimeout(approval.timer);
+      const conversation = conversations.get(approval.conversationId);
+      if (conversation?.runId) {
+        await runtime.recordApproval(conversation.runId, {
+          id: approvalId,
+          turn: conversation.turn || 1,
+          provider: conversation.provider,
+          tool: 'unknown',
+          arguments: {},
+          riskSummary: 'Permission action resolved by the user.',
+          outcome: approved === true ? 'approved' : 'rejected',
+          actor: 'user'
+        });
+      }
       approval.resolve(approved === true
         ? { kind: 'approved' }
         : { kind: 'reject', feedback: 'The user denied this permission in PHANTOM.' });
