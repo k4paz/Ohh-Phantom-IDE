@@ -121,10 +121,16 @@ module.exports = (core) => {
       let total = 0; let changed = 0;
       for (const f of opts.files) {
         const file = abs(f);
-        const txt = await fsp.readFile(file, 'utf8');
-        let count = 0;
-        const out = txt.replace(re, (...m) => { count++; return opts.regex ? m[0].replace(new RegExp(re.source, re.flags.replace('g', '')), opts.replacement) : opts.replacement; });
-        if (count) { await fsp.writeFile(file, out, 'utf8'); total += count; changed++; }
+        await core.withFileLock(file, async () => {
+          const txt = await fsp.readFile(file, 'utf8');
+          let count = 0;
+          const out = txt.replace(re, (...m) => { count++; return opts.regex ? m[0].replace(new RegExp(re.source, re.flags.replace('g', '')), opts.replacement) : opts.replacement; });
+          if (count) {
+            await fsp.writeFile(file, out, 'utf8');
+            total += count;
+            changed++;
+          }
+        });
       }
       core.event('FS', `replaced ${total} occurrence(s) in ${changed} file(s)`);
       return { files: changed, replacements: total };

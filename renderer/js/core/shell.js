@@ -27,6 +27,20 @@ function resetDesktopView() {
   wm.changed('viewport');
 }
 
+function snapFocusedWindow(key) {
+  const f = wm.focused;
+  if (!f) return;
+  if (f.min) {
+    if (key === 'ArrowUp') { wm.restore(f); wm.focus(f); }
+    return;
+  }
+  const z = f.snapZone; const m = f.max;
+  if (key === 'ArrowLeft') wm.snap(f, z === 'right' ? 'center' : z === 'tl' || z === 'bl' ? z : 'left');
+  else if (key === 'ArrowRight') wm.snap(f, z === 'left' ? 'center' : z === 'tr' || z === 'br' ? z : 'right');
+  else if (key === 'ArrowUp') { if (z === 'left') wm.snap(f, 'tl'); else if (z === 'right') wm.snap(f, 'tr'); else if (z === 'bl') wm.snap(f, 'left'); else if (z === 'br') wm.snap(f, 'right'); else wm.maximize(f); }
+  else if (key === 'ArrowDown') { if (m) wm.unmaximize(f); else if (z === 'left') wm.snap(f, 'bl'); else if (z === 'right') wm.snap(f, 'br'); else if (z === 'tl') wm.snap(f, 'left'); else if (z === 'tr') wm.snap(f, 'right'); else wm.minimize(f, true, true); }
+}
+
 // Fractional layouts (desk 1×1) — scaled to the real desktop by restoreLayout.
 export const PRESETS = {
   'Dev station': [
@@ -118,7 +132,6 @@ export function commands() {
     { group: 'window', label: 'Show desktop', icon: 'layout', key: 'Ctrl+Alt+D', run: () => wm.showDesktop() },
     { group: 'window', label: 'Duplicate focused window', icon: 'layout', key: 'Ctrl+Shift+D', run: () => wm.focused && wm.duplicate(wm.focused) },
     { group: 'window', label: 'Close all other windows', icon: 'close', key: 'Ctrl+Shift+R', run: () => wm.focused && wm.closeOthers(wm.focused) },
-    { group: 'window', label: 'Cycle windows', icon: 'layout', key: 'Ctrl+Tab', run: () => wm.cycle(1) },
     { group: 'window', label: 'Close all windows in this workspace', icon: 'close', run: async () => { for (const w of [...wm.windows]) if (w.ws === wm.active) await wm.close(w); } },
     { group: 'window', label: 'Toggle always-on-top for focused window', icon: 'pin', run: () => wm.focused && wm.setPinned(wm.focused, !wm.focused.pinned) },
     ...[0, 1, 2, 3].map((i) => ({ group: 'window', label: `Switch to workspace ${i + 1}`, icon: 'layout', key: `Ctrl+Shift+${i + 1}`, run: () => wm.switchWorkspace(i) })),
@@ -211,7 +224,11 @@ function buildTopbar() {
       { label: 'Tile', key: 'Ctrl+Alt+T', action: () => wm.tile() },
       { label: 'Cascade', action: () => wm.cascade() },
       { label: 'Show desktop', key: 'Ctrl+Alt+D', action: () => wm.showDesktop() },
-      { label: 'Cycle windows', key: 'Ctrl+Tab', action: () => wm.cycle(1) },
+      ...[['ArrowLeft', '←'], ['ArrowRight', '→'], ['ArrowUp', '↑'], ['ArrowDown', '↓']].map(([keyName, hint]) => ({
+        label: `Snap focused window ${keyName.slice(5).toLowerCase()}`,
+        key: platform === 'win32' ? `Win+${hint} (kiosk) / Ctrl+Alt+Shift+${hint}` : `Ctrl+Alt+Shift+${hint}`,
+        action: () => snapFocusedWindow(keyName)
+      })),
       '-',
       { label: 'Snapping to edges', check: settings.snap, action: () => setSetting('snap', !settings.snap) },
       { label: 'Magnetic alignment', check: settings.magnet > 0, action: () => setSetting('magnet', settings.magnet > 0 ? 0 : 10) },
@@ -336,7 +353,7 @@ function buildTaskbar() {
     const list = wm.windows.filter((w) => w.ws === wm.active).sort((a, b) => a.id - b.id);
     tasks.innerHTML = '';
     for (const [index, w] of list.entries()) {
-      const shortcut = index < 9 ? ` · Shift+${index + 1}` : '';
+      const shortcut = index < 9 ? ` · Shift+${index + 1} (double-press resets desktop)` : '';
       const b = h('button.task' + (w === wm.focused ? '.focus' : '') + (w.min ? '.min' : ''), { 'data-win': w.id, title: `${w.title}${w.sub ? ' — ' + w.sub : ''}${shortcut}`, html: `${icon(w.app.icon)}<span>${esc(w.title)}${w.sub ? ' <span class="c-dim">' + esc(basename(w.sub)) + '</span>' : ''}</span>${w.pinned ? '<span class="pin">▲</span>' : ''}` });
       b.addEventListener('click', () => { if (w === wm.focused && !w.min) wm.minimize(w); else { wm.restore(w); wm.focus(w); } });
       b.addEventListener('auxclick', (e) => { if (e.button === 1) wm.close(w); });
@@ -366,13 +383,15 @@ function buildTaskbar() {
 function buildWallpaper() {
   const wp = document.getElementById('wallpaper');
   const sig = h('div.sig');
-  const hint = h('div.hint');
-  const commandHints = '<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> command palette &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>`</kbd> terminal &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>O</kbd> open project &nbsp;·&nbsp; <kbd>F5</kbd> run<br>drag windows to screen edges to snap · <kbd>Alt</kbd> while dragging disables magnets';
-  wp.append(sig, hint);
+  wp.append(sig);
 
   const desktop = document.getElementById('desktop');
   let panDrag = null;
   let suppressContextMenu = false;
+  desktop.addEventListener('dblclick', (event) => {
+    if (event.target !== desktop && event.target !== wp) return;
+    wm.unfocus();
+  });
   const drawWallpaper = () => {
     const { panX, panY } = wm.viewport;
     wp.style.setProperty('--wallpaper-grid-size', '32px');
@@ -424,9 +443,6 @@ function buildWallpaper() {
   const upd = () => {
     const s = telemetry.static;
     sig.innerHTML = `<b>PHANTOM</b>${s ? `${esc(s.user)}@${esc(s.hostname)} · ${esc(s.distro)} · ${esc(s.cpuModel)} × ${s.cores}` : ''}`;
-    const hasWindows = wm.windows.some((w) => w.visible);
-    hint.innerHTML = `${commandHints}<br>middle/right-drag desktop to move the viewport`;
-    hint.style.display = hasWindows ? 'none' : '';
   };
   bus.on('wm:changed', upd);
   bus.on('settings:changed', (key) => { if (key === 'grid') upd(); });
@@ -443,27 +459,8 @@ function keybindings() {
     else if (action === 'commit') wm.commitWindowSwitcher();
     else if (action === 'cancel') wm.cancelWindowSwitcher();
   });
-  const snapFocusedWindow = (key) => {
-    const f = wm.focused;
-    if (!f) return;
-    if (f.min) {
-      if (key === 'ArrowUp') { wm.restore(f); wm.focus(f); }
-      return;
-    }
-    const z = f.snapZone; const m = f.max;
-    if (key === 'ArrowLeft') wm.snap(f, z === 'right' ? 'center' : z === 'tl' || z === 'bl' ? z : 'left');
-    else if (key === 'ArrowRight') wm.snap(f, z === 'left' ? 'center' : z === 'tr' || z === 'br' ? z : 'right');
-    else if (key === 'ArrowUp') { if (z === 'left') wm.snap(f, 'tl'); else if (z === 'right') wm.snap(f, 'tr'); else if (z === 'bl') wm.snap(f, 'left'); else if (z === 'br') wm.snap(f, 'right'); else wm.maximize(f); }
-    else if (key === 'ArrowDown') { if (m) wm.unmaximize(f); else if (z === 'left') wm.snap(f, 'bl'); else if (z === 'right') wm.snap(f, 'br'); else if (z === 'tl') wm.snap(f, 'left'); else if (z === 'tr') wm.snap(f, 'right'); else wm.minimize(f, true, true); }
-  };
   on('app:snapWindow', snapFocusedWindow);
   on('app:kioskError', (message) => fail(message, 'HARD FULLSCREEN'));
-  document.addEventListener('keydown', (e) => {
-    if (!(e.ctrlKey || e.metaKey) || e.altKey || (e.key !== 'Tab' && e.code !== 'Tab')) return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
-    wm.cycle(e.shiftKey ? -1 : 1);
-  }, true);
   document.addEventListener('keydown', (e) => {
     const ctrl = e.ctrlKey || e.metaKey; const k = e.key;
     const digit = Number(/^(?:Digit|Numpad)([1-9])$/.exec(e.code)?.[1] || (/^[1-9]$/.test(k) ? k : 0));
@@ -475,10 +472,12 @@ function keybindings() {
       wm.switchWorkspace(digit - 1);
     }
     else if (!ctrl && e.shiftKey && !e.altKey && digit >= 1 && digit <= 9) {
-      stop();
+      const target = e.target instanceof Element ? e.target : null;
+      if (target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], .monaco-editor, .xterm')) return;
       const task = document.querySelector(`#taskbar .tasks .task:nth-child(${digit})`);
       const win = task && wm.windows.find((item) => item.id === Number(task.dataset.win));
       if (win) {
+        stop();
         const now = performance.now();
         const repeated = !e.repeat && lastTaskShortcut?.digit === digit && lastTaskShortcut.win === win
           && now - lastTaskShortcut.at <= 800;
@@ -525,6 +524,7 @@ function keybindings() {
     else if (ctrl && e.altKey && /^Digit[1-4]$/.test(e.code)) { stop(); const i = Number(e.code.slice(5)) - 1; if (e.shiftKey && f) wm.moveToWorkspace(f, i); else wm.switchWorkspace(i); }
     else if (ctrl && e.altKey && (k === 't' || k === 'T')) { stop(); wm.tile(); }
     else if (ctrl && e.altKey && (k === 'd' || k === 'D')) { stop(); wm.showDesktop(); }
+    else if (ctrl && e.altKey && e.shiftKey && f && k.startsWith('Arrow')) { stop(); snapFocusedWindow(k); }
     else if (platform === 'win32' && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && f && k.startsWith('Arrow')) {
       stop();
       snapFocusedWindow(k);
