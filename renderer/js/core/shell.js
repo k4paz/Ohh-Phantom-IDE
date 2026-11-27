@@ -118,7 +118,6 @@ export function commands() {
     { group: 'window', label: 'Show desktop', icon: 'layout', key: 'Ctrl+Alt+D', run: () => wm.showDesktop() },
     { group: 'window', label: 'Duplicate focused window', icon: 'layout', key: 'Ctrl+Shift+D', run: () => wm.focused && wm.duplicate(wm.focused) },
     { group: 'window', label: 'Close all other windows', icon: 'close', key: 'Ctrl+Shift+R', run: () => wm.focused && wm.closeOthers(wm.focused) },
-    { group: 'window', label: 'Cycle windows', icon: 'layout', key: 'Ctrl+Tab', run: () => wm.cycle(1) },
     { group: 'window', label: 'Close all windows in this workspace', icon: 'close', run: async () => { for (const w of [...wm.windows]) if (w.ws === wm.active) await wm.close(w); } },
     { group: 'window', label: 'Toggle always-on-top for focused window', icon: 'pin', run: () => wm.focused && wm.setPinned(wm.focused, !wm.focused.pinned) },
     ...[0, 1, 2, 3].map((i) => ({ group: 'window', label: `Switch to workspace ${i + 1}`, icon: 'layout', key: `Ctrl+Shift+${i + 1}`, run: () => wm.switchWorkspace(i) })),
@@ -211,7 +210,6 @@ function buildTopbar() {
       { label: 'Tile', key: 'Ctrl+Alt+T', action: () => wm.tile() },
       { label: 'Cascade', action: () => wm.cascade() },
       { label: 'Show desktop', key: 'Ctrl+Alt+D', action: () => wm.showDesktop() },
-      { label: 'Cycle windows', key: 'Ctrl+Tab', action: () => wm.cycle(1) },
       ...[['ArrowLeft', '←'], ['ArrowRight', '→'], ['ArrowUp', '↑'], ['ArrowDown', '↓']].map(([keyName, hint]) => ({
         label: `Snap focused window ${keyName.slice(5).toLowerCase()}`,
         key: platform === 'win32' ? `Win+${hint} (kiosk) / Ctrl+Alt+Shift+${hint}` : `Ctrl+Alt+Shift+${hint}`,
@@ -467,12 +465,6 @@ function keybindings() {
   };
   on('app:snapWindow', snapFocusedWindow);
   on('app:kioskError', (message) => fail(message, 'HARD FULLSCREEN'));
-  document.addEventListener('keydown', (e) => {
-    if (!(e.ctrlKey || e.metaKey) || e.altKey || (e.key !== 'Tab' && e.code !== 'Tab')) return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
-    wm.cycle(e.shiftKey ? -1 : 1);
-  }, true);
   document.addEventListener('keydown', (e) => {
     const ctrl = e.ctrlKey || e.metaKey; const k = e.key;
     const digit = Number(/^(?:Digit|Numpad)([1-9])$/.exec(e.code)?.[1] || (/^[1-9]$/.test(k) ? k : 0));
