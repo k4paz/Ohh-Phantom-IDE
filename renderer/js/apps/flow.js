@@ -276,7 +276,9 @@ export default {
     const permissionSelect = h('select.inp.af-manager-permission',
       h('option', { value: 'manual' }, 'Manual approval'),
       h('option', { value: 'assisted' }, 'Assisted reads'),
-      h('option', { value: 'project-scoped' }, 'Project-scoped files')
+      h('option', { value: 'project-scoped' }, 'Project-scoped files'),
+      h('option', { value: 'auto' }, 'Auto-allow (still confirm sandbox bypass)')
+
     );
     const revisionInput = h('input.inp.af-manager-rounds', { type: 'number', min: 0, max: MAX_REVISION_ROUNDS, step: 1 });
     const capacityStatus = h('span.af-capacity-status', 'Checking host capacity…');

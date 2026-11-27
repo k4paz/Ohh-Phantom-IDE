@@ -539,7 +539,7 @@ export class WindowManager {
     this.windowSwitcherPanel = h('div.window-switcher-panel',
       h('div.window-switcher-heading', h('span', 'OPEN WINDOWS'), h('span.window-switcher-hint', 'ALT + TAB')),
       this.windowSwitcherGrid = h('div.window-switcher-grid'),
-      h('div.window-switcher-footer', 'Release ALT to switch · ESC to cancel')
+      h('div.window-switcher-footer', 'Release ALT to switch · ESC to cancel · Middle-click to close')
     ));
     document.body.appendChild(this.windowSwitcherEl);
   }
@@ -606,11 +606,18 @@ export class WindowManager {
       const card = h('button.window-switcher-card', {
         type: 'button',
         'aria-label': `${win.title} — ${win.app.title}`,
+        title: 'Middle-click to close window',
         'aria-pressed': index === state.selectedIndex ? 'true' : 'false',
         on: {
           click: () => {
             this.selectWindowSwitcherItem(index);
             this.commitWindowSwitcher();
+          },
+          auxclick: (event) => {
+            if (event.button !== 1) return;
+            event.preventDefault();
+            event.stopPropagation();
+            this.close(win);
           }
         }
       },

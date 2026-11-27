@@ -119,8 +119,11 @@ function agentOptions(provider, value) {
   const agentMode = value.agentMode || 'interactive';
   if (!['interactive', 'plan', 'autopilot'].includes(agentMode)) throw new Error('Unsupported agent mode.');
   const permissionMode = value.permissionMode || 'manual';
-  if (!['manual', 'assisted', 'project-scoped'].includes(permissionMode)) throw new Error('Unsupported permission mode.');
-  if (provider !== 'copilot' && permissionMode !== 'manual') {
+  // AUTO: 'auto' added to the allowlist and now available to every provider.
+  if (!['manual', 'assisted', 'project-scoped', 'auto'].includes(permissionMode)) throw new Error('Unsupported permission mode.');
+  // AUTO: only the *scoped* modes remain Copilot-only. 'auto' maps to each
+  // provider's native "never ask" switch (see createCodexConversation / runClaude).
+  if (provider !== 'copilot' && permissionMode !== 'manual' && permissionMode !== 'auto') {
     throw new Error(`Custom permission modes are supported only for Copilot; ${provider} uses its native approval flow.`);
   }
   const enableMcp = value.enableMcp === true;
@@ -369,10 +372,21 @@ module.exports = (core) => {
         enableConfigDiscovery: options.enableMcp,
         events: { streaming: true },
         permissions: {
+          // 'auto' still uses 'manual' here so the SDK delegates to onRequest,
+          // where we can enforce the sandbox-bypass / managed-approval guard.
           mode: options.permissionMode === 'assisted' ? 'assisted' : 'manual',
           onRequest: (request, invocation) => {
             if (options.agentMode === 'plan' && request.kind !== 'read') {
               return { kind: 'reject', feedback: 'Plan mode is read-only.' };
+            }
+            // AUTO: 'auto' approves everything except explicit sandbox-bypass
+            // and managed-approval requests, which always go to the human.
+            if (options.permissionMode === 'auto') {
+              const explicitApprovalRequired =
+                request.requestSandboxBypass === true ||
+                request.managedApprovalRequired === true ||
+                invocation?.promptRequest?.managedApprovalRequired === true;
+              if (!explicitApprovalRequired) return { kind: 'approved' };
             }
             if (options.permissionMode === 'project-scoped' && projectScopedApproval(request, invocation, cwd)) {
               return { kind: 'approved' };
@@ -433,7 +447,10 @@ module.exports = (core) => {
       workingDirectory: cwd,
       skipGitRepoCheck: true,
       sandboxMode: options.agentMode === 'autopilot' ? 'workspace-write' : 'read-only',
-      approvalPolicy: 'on-request'
+      // AUTO: 'auto' maps to Codex's native "never ask" approval policy.
+      // The sandbox still applies (read-only in interactive/plan, workspace-write
+      // in autopilot); this only removes the prompt.
+      approvalPolicy: options.permissionMode === 'auto' ? 'never' : 'on-request'
     });
     return {
       id, provider: 'codex', cwd, thread, busy: false, controller: null,
@@ -454,11 +471,15 @@ module.exports = (core) => {
     return new Promise((resolve, reject) => {
       const cli = which('claude');
       if (!cli) return reject(new Error('Claude Code CLI was not found. Install it with: npm install -g @anthropic-ai/claude-code'));
-      const permissionMode = conversation.options.agentMode === 'plan'
-        ? 'plan'
-        : conversation.options.agentMode === 'autopilot'
-          ? 'acceptEdits'
-          : 'default';
+      // AUTO: 'auto' maps to the Claude Code CLI's bypassPermissions mode.
+      // Plan mode still takes precedence so a read-only session stays read-only.
+      const permissionMode = conversation.options.permissionMode === 'auto' && conversation.options.agentMode !== 'plan'
+        ? 'bypassPermissions'
+        : conversation.options.agentMode === 'plan'
+          ? 'plan'
+          : conversation.options.agentMode === 'autopilot'
+            ? 'acceptEdits'
+            : 'default';
       let command = cli;
       let args = ['--print', '--output-format', 'text', '--permission-mode', permissionMode];
       if (conversation.options.model) args.push('--model', conversation.options.model);
