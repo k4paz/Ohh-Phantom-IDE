@@ -1,0 +1,155 @@
+{
+  "name": "Multi-agent review",
+  "nodes": [
+    {
+      "id": "task",
+      "type": "input",
+      "label": "Task",
+      "x": 12,
+      "y": 476.25,
+      "prompt": "Resume\n"
+    },
+    {
+      "id": "codex-reviewer",
+      "type": "agent",
+      "provider": "copilot",
+      "model": "auto",
+      "reasoningEffort": "",
+      "webSearchMode": "disabled",
+      "label": "Independent reviewer",
+      "x": 548.75,
+      "y": 440,
+      "instructions": "Independently analyze the task and project for correctness, edge cases, and likely regressions. Give concrete findings and tests. Do not edit files.",
+      "agentMode": "plan",
+      "permissionMode": "manual",
+      "enableMcp": false,
+      "accountId": "",
+      "agentRoleMode": "advanced",
+      "simpleRole": "backend",
+      "role": "reviewer"
+    },
+    {
+      "id": "claude-architect",
+      "type": "agent",
+      "provider": "copilot",
+      "model": "auto",
+      "reasoningEffort": "",
+      "label": "Architecture reviewer",
+      "x": 386.5,
+      "y": 619,
+      "instructions": "Review the project structure and task from an architecture perspective. Identify integration risks, simpler alternatives, and validation gaps. Do not edit files.",
+      "webSearchMode": "disabled",
+      "agentMode": "plan",
+      "permissionMode": "manual",
+      "enableMcp": false,
+      "accountId": "",
+      "agentRoleMode": "advanced",
+      "simpleRole": "backend",
+      "role": "reviewer"
+    },
+    {
+      "id": "orchestrator",
+      "type": "orchestrator",
+      "provider": "copilot",
+      "model": "auto",
+      "reasoningEffort": "",
+      "label": "Orchestrator",
+      "x": 927.5,
+      "y": 446.25,
+      "instructions": "Respond to every worker by name. Reconcile disagreements, call out unsupported claims, and produce one actionable, prioritized final response. Do not edit files.",
+      "webSearchMode": "disabled",
+      "revisionRounds": 3,
+      "agentMode": "plan",
+      "permissionMode": "manual",
+      "enableMcp": false,
+      "accountId": "",
+      "agentRoleMode": "advanced",
+      "simpleRole": "backend"
+    },
+    {
+      "id": "result",
+      "type": "output",
+      "label": "Final response",
+      "x": 1260,
+      "y": 422.5
+    },
+    {
+      "id": "agent-1795705547935-3",
+      "type": "agent",
+      "provider": "copilot",
+      "model": "auto",
+      "reasoningEffort": "",
+      "label": "Specialist 4",
+      "x": 316.25,
+      "y": 317.5,
+      "instructions": "Analyze the task from your assigned specialty. Return findings and recommendations. Do not edit files.",
+      "webSearchMode": "disabled",
+      "agentMode": "plan",
+      "permissionMode": "manual",
+      "enableMcp": false,
+      "accountId": "",
+      "agentRoleMode": "advanced",
+      "simpleRole": "backend",
+      "role": "worker"
+    },
+    {
+      "id": "compiler",
+      "type": "compiler",
+      "label": "Compiler & Tests",
+      "x": 927.5,
+      "y": 766.25,
+      "buildCommand": "auto",
+      "testCommand": "auto"
+    }
+  ],
+  "edges": [
+    {
+      "source": "task",
+      "target": "claude-architect"
+    },
+    {
+      "source": "claude-architect",
+      "target": "orchestrator"
+    },
+    {
+      "source": "orchestrator",
+      "target": "result"
+    },
+    {
+      "source": "task",
+      "target": "agent-1795705547935-3"
+    },
+    {
+      "source": "agent-1795705547935-3",
+      "target": "orchestrator"
+    },
+    {
+      "source": "codex-reviewer",
+      "target": "orchestrator"
+    },
+    {
+      "source": "agent-1795705547935-3",
+      "target": "codex-reviewer"
+    },
+    {
+      "source": "claude-architect",
+      "target": "codex-reviewer"
+    },
+    {
+      "source": "codex-reviewer",
+      "target": "compiler"
+    },
+    {
+      "source": "claude-architect",
+      "target": "compiler"
+    },
+    {
+      "source": "agent-1795705547935-3",
+      "target": "compiler"
+    },
+    {
+      "source": "compiler",
+      "target": "orchestrator"
+    }
+  ]
+}

@@ -29,7 +29,8 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 app.commandLine.appendSwitch('enable-features', 'CanvasOopRasterization');
-if (!app.requestSingleInstanceLock()) app.quit();
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
 
 let mainWindow = null;
 let core = null;
@@ -148,6 +149,7 @@ function hardenSession() {
 }
 
 app.whenReady().then(() => {
+  if (!hasSingleInstanceLock) return;
   // PHANTOM owns all keybindings (Ctrl+W, Ctrl+R… are editor/WM shortcuts). macOS keeps a minimal
   // menu so system clipboard shortcuts and Cmd+Q keep working.
   Menu.setApplicationMenu(process.platform === 'darwin' ? Menu.buildFromTemplate([{ role: 'appMenu' }, { role: 'editMenu' }]) : null);

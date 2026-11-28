@@ -7,6 +7,8 @@ const { randomUUID } = require('crypto');
 const { spawn, execFile } = require('child_process');
 const { which, readJson, writeJsonAtomic } = require('../util');
 const { getAgentCapacity } = require('./flow-capacity');
+const { createRuntime } = require('../agent-runtime');
+const { createPlatform } = require('../agent-platform');
 
 const COPILOT_SEND_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -109,7 +111,8 @@ function agentOptions(provider, value) {
   const efforts = {
     copilot: ['low', 'medium', 'high', 'xhigh', 'max'],
     codex: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent'],
-    claude: ['low', 'medium', 'high', 'xhigh', 'max']
+    claude: ['low', 'medium', 'high', 'xhigh', 'max'],
+    local: ['minimal', 'low', 'medium', 'high']
   };
   const reasoningEffort = value.reasoningEffort || '';
   if (reasoningEffort && !efforts[provider].includes(reasoningEffort)) throw new Error(`Unsupported reasoning effort for ${provider}.`);
@@ -119,7 +122,7 @@ function agentOptions(provider, value) {
   const agentMode = value.agentMode || 'interactive';
   if (!['interactive', 'plan', 'autopilot'].includes(agentMode)) throw new Error('Unsupported agent mode.');
   const permissionMode = value.permissionMode || 'manual';
-  if (!['manual', 'assisted', 'project-scoped'].includes(permissionMode)) throw new Error('Unsupported permission mode.');
+  if (!['manual', 'assisted', 'project-scoped', 'auto'].includes(permissionMode)) throw new Error('Unsupported permission mode.');
   if (provider !== 'copilot' && permissionMode !== 'manual') {
     throw new Error(`Custom permission modes are supported only for Copilot; ${provider} uses its native approval flow.`);
   }
@@ -234,14 +237,16 @@ function fetchCopilotQuota() {
 module.exports = (core) => {
   const conversations = new Map();
   const pendingApprovals = new Map();
+  const runtime = createRuntime(core);
+  const platform = createPlatform(core);
   let creatingConversations = 0;
   const accountStateFile = path.join(core.dataDir, 'agent-accounts.json');
   let accountWrites = Promise.resolve();
 
   const emptyAccountState = () => ({
-    profiles: { copilot: [], codex: [], claude: [] },
-    active: { copilot: 'default', codex: 'default', claude: 'default' },
-    usage: { copilot: {}, codex: {}, claude: {} }
+    profiles: { copilot: [], codex: [], claude: [], local: [] },
+    active: { copilot: 'default', codex: 'default', claude: 'default', local: 'default' },
+    usage: { copilot: {}, codex: {}, claude: {}, local: {} }
   });
 
   async function readAccountState() {
@@ -296,6 +301,7 @@ module.exports = (core) => {
 
   function accountEnvironment(provider, id) {
     if (id === 'default') return {};
+    if (provider === 'local') return {};
     const directory = accountDirectory(provider, id);
     if (provider === 'copilot') return { COPILOT_HOME: directory };
     if (provider === 'codex') return { CODEX_HOME: directory };
@@ -312,13 +318,15 @@ module.exports = (core) => {
         reportedInputTokens: (Number(existing.reportedInputTokens) || 0) + turn.reportedInputTokens,
         reportedOutputTokens: (Number(existing.reportedOutputTokens) || 0) + turn.reportedOutputTokens,
         reportedTokenTurns: (Number(existing.reportedTokenTurns) || 0) + turn.reportedTokenTurns,
+        reportedCostUsd: (Number(existing.reportedCostUsd) || 0) + (Number(turn.reportedCostUsd) || 0),
+        unpricedTurns: (Number(existing.unpricedTurns) || 0) + (turn.completed && !turn.costKnown ? 1 : 0),
         updatedAt: Date.now()
       };
     });
   }
 
   function requireProvider(provider) {
-    if (!['copilot', 'codex', 'claude'].includes(provider)) throw new Error('Unsupported agent provider.');
+    if (!['copilot', 'codex', 'claude', 'local'].includes(provider)) throw new Error('Unsupported agent provider.');
     return provider;
   }
 
@@ -333,11 +341,53 @@ module.exports = (core) => {
     if (conversations.has(conversationId)) core.emit('agent:event', { conversationId, ...event });
   }
 
-  function requestPermission(conversationId, request) {
+  async function requestPermission(conversationId, request, recordedPermission = null) {
+    const conversation = conversations.get(conversationId);
+    const runId = conversation?.runId;
+    const action = request?.kind === 'shell' ? 'send'
+      : request?.kind === 'url' ? 'network'
+      : request?.kind === 'write' ? 'write'
+      : request?.kind === 'read' ? 'read'
+      : 'send';
+    let permission = recordedPermission;
+    if (runId) {
+      permission ||= await runtime.recordPermissionDecision(runId, {
+        turn: conversation.turn || 1,
+        role: 'worker',
+        tool: action === 'write' ? 'write_file' : action === 'read' ? 'read_file' : 'summarize',
+        action,
+        provider: conversation.provider
+      });
+    }
+    if (permission?.decision === 'deny') {
+      return { kind: 'reject', feedback: permission.reason };
+    }
     const approvalId = randomUUID();
+    if (runId) {
+      await runtime.recordApproval(runId, {
+        id: approvalId,
+        turn: conversation.turn || 1,
+        provider: conversation.provider,
+        tool: action,
+        arguments: request,
+        riskSummary: `Allow ${action} action requested by the ${conversation.provider} agent?`
+      });
+    }
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         pendingApprovals.delete(approvalId);
+        if (runId) {
+          runtime.recordApproval(runId, {
+            id: approvalId,
+            turn: conversation.turn || 1,
+            provider: conversation.provider,
+            tool: action,
+            arguments: request,
+            riskSummary: 'Permission request expired before a human decision.',
+            outcome: 'expired',
+            actor: 'system'
+          }).catch((error) => core.log('error', `approval audit failed: ${error.message}`, 'AGENTS'));
+        }
         resolve({ kind: 'reject', feedback: 'Permission request timed out.' });
       }, 5 * 60 * 1000);
       pendingApprovals.set(approvalId, { conversationId, resolve, timer });
@@ -348,6 +398,39 @@ module.exports = (core) => {
         details: permissionDetails(request)
       });
     });
+  }
+
+  function budgetScopes(conversation) {
+    return [
+      { scope: 'provider', key: conversation.provider },
+      { scope: 'project', key: conversation.cwd },
+      { scope: 'user', key: conversation.accountId || 'default' }
+    ];
+  }
+
+  async function providerMessages(conversation) {
+    const run = await runtime.getRun(conversation.runId);
+    if (!run) throw new Error('Agent run no longer exists.');
+    const messages = [];
+    let remaining = 60000;
+    for (const entry of [...run.transcript].reverse().slice(0, 100)) {
+      const role = entry.role === 'user' ? 'user' : 'assistant';
+      const content = String(entry.content || '');
+      if (content.length > remaining) {
+        if (messages.length === 0) messages.unshift({ role, content: content.slice(-remaining) });
+        break;
+      }
+      messages.unshift({ role, content });
+      remaining -= content.length;
+      if (remaining <= 0) break;
+    }
+    return messages;
+  }
+
+  function providerPrompt(prompt, priorMessages) {
+    if (!priorMessages.length) return prompt;
+    const history = priorMessages.map((message) => `${message.role.toUpperCase()}: ${message.content}`).join('\n\n');
+    return `Prior conversation context:\n${history}\n\nCurrent user message:\n${prompt}`;
   }
 
   async function createCopilotConversation(id, cwd, options, accountEnv) {
@@ -369,10 +452,43 @@ module.exports = (core) => {
         enableConfigDiscovery: options.enableMcp,
         events: { streaming: true },
         permissions: {
+          // 'auto' still uses 'manual' here so the SDK delegates to onRequest,
+          // where we can enforce the sandbox-bypass / managed-approval guard.
           mode: options.permissionMode === 'assisted' ? 'assisted' : 'manual',
           onRequest: (request, invocation) => {
             if (options.agentMode === 'plan' && request.kind !== 'read') {
               return { kind: 'reject', feedback: 'Plan mode is read-only.' };
+            }
+            if (options.permissionMode === 'auto') {
+              const action = request?.kind === 'shell' ? 'send'
+                : request?.kind === 'url' ? 'network'
+                : request?.kind === 'write' ? 'write'
+                : request?.kind === 'read' ? 'read'
+                : 'send';
+              const permission = runtime.recordPermissionDecision(options.runId, {
+                turn: conversations.get(id)?.turn || 1,
+                role: 'worker',
+                tool: action === 'write' ? 'write_file' : action === 'read' ? 'read_file' : 'summarize',
+                action,
+                provider: 'copilot'
+              });
+              return permission.then(async (decision) => {
+                if (decision.decision === 'allow' && request.requestSandboxBypass !== true &&
+                  request.managedApprovalRequired !== true && invocation?.promptRequest?.managedApprovalRequired !== true) {
+                  await runtime.recordApproval(options.runId, {
+                    turn: conversations.get(id)?.turn || 1,
+                    provider: 'copilot',
+                    tool: action,
+                    arguments: request,
+                    riskSummary: `Auto-approved ${action} by Phantom policy.`,
+                    outcome: 'approved',
+                    actor: 'auto-policy'
+                  });
+                  return { kind: 'approved' };
+                }
+                if (decision.decision === 'deny') return { kind: 'reject', feedback: decision.reason };
+                return requestPermission(id, request, decision);
+              });
             }
             if (options.permissionMode === 'project-scoped' && projectScopedApproval(request, invocation, cwd)) {
               return { kind: 'approved' };
@@ -386,11 +502,14 @@ module.exports = (core) => {
       });
       const conversation = {
         id, provider: 'copilot', cwd, client, session, busy: false,
-        accountId: options.accountId, currentUsage: null
+        accountId: options.accountId, currentUsage: null, runId: options.runId, turn: 0
       };
       session.on('assistant.message_delta', (event) => {
         const text = event.data.deltaContent || '';
-        if (conversation.currentUsage) conversation.currentUsage.outputChars += text.length;
+        if (conversation.currentUsage) {
+          conversation.currentUsage.outputChars += text.length;
+          conversation.currentUsage.outputText += text;
+        }
         emit(id, { type: 'delta', text });
       });
       return conversation;
@@ -437,7 +556,7 @@ module.exports = (core) => {
     });
     return {
       id, provider: 'codex', cwd, thread, busy: false, controller: null,
-      accountId: options.accountId, currentUsage: null
+      accountId: options.accountId, currentUsage: null, runId: options.runId, turn: 0
     };
   }
 
@@ -450,10 +569,13 @@ module.exports = (core) => {
     }
   }
 
-  function runClaude(conversation, prompt) {
+  function runClaude(conversation, prompt, history = []) {
     return new Promise((resolve, reject) => {
       const cli = which('claude');
       if (!cli) return reject(new Error('Claude Code CLI was not found. Install it with: npm install -g @anthropic-ai/claude-code'));
+      const requestPrompt = history.length
+        ? `Conversation history:\n${history.map((message) => `${message.role.toUpperCase()}: ${message.content}`).join('\n\n')}\n\nCurrent user message:\n${prompt}`
+        : prompt;
       const permissionMode = conversation.options.agentMode === 'plan'
         ? 'plan'
         : conversation.options.agentMode === 'autopilot'
@@ -463,11 +585,11 @@ module.exports = (core) => {
       let args = ['--print', '--output-format', 'text', '--permission-mode', permissionMode];
       if (conversation.options.model) args.push('--model', conversation.options.model);
       if (conversation.options.reasoningEffort) args.push('--effort', conversation.options.reasoningEffort);
-      args.push(prompt);
+      args.push(requestPrompt);
       if (process.platform === 'win32') {
         command = which('pwsh') || which('powershell');
         if (!command) return reject(new Error('PowerShell is required to run Claude Code workflows on Windows.'));
-        const encodedPrompt = Buffer.from(prompt, 'utf8').toString('base64');
+        const encodedPrompt = Buffer.from(requestPrompt, 'utf8').toString('base64');
         const encodedModel = Buffer.from(conversation.options.model, 'utf8').toString('base64');
         const modelSetup = conversation.options.model
           ? `$m=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedModel}')); $claudeArgs+=@('--model',$m); `
@@ -510,7 +632,10 @@ module.exports = (core) => {
           return;
         }
         output += chunk;
-        if (conversation.currentUsage) conversation.currentUsage.outputChars += chunk.length;
+        if (conversation.currentUsage) {
+          conversation.currentUsage.outputChars += chunk.length;
+          conversation.currentUsage.outputText += chunk;
+        }
         emit(conversation.id, { type: 'delta', text: chunk });
       });
       child.stderr.on('data', (chunk) => {
@@ -538,10 +663,20 @@ module.exports = (core) => {
           if (sizes) {
             sizes.set(itemId, Math.max(sizes.get(itemId) || 0, text.length));
             conversation.currentUsage.outputChars = [...sizes.values()].reduce((total, size) => total + size, 0);
+            conversation.currentUsage.outputText = text;
           }
           emit(conversation.id, { type: 'replace', text });
         }
-        else if (event.item.type === 'command_execution') emit(conversation.id, { type: 'activity', text: event.item.command });
+        else if (event.item.type === 'command_execution') {
+          emit(conversation.id, { type: 'activity', text: event.item.command });
+          await runtime.addToolCall(conversation.runId, {
+            turn: conversation.turn,
+            tool: 'run_tests',
+            arguments: { command: event.item.command },
+            outcome: event.item.status === 'failed' ? 'failed' : 'success',
+            latencyMs: 0
+          }).catch((error) => core.log('error', `tool audit failed: ${error.message}`, 'AGENTS'));
+        }
       } else if (event.type === 'turn.failed' || event.type === 'error') {
         throw new Error(event.error?.message || event.message || 'Codex turn failed.');
       } else if (event.type === 'turn.completed' && conversation.currentUsage && event.usage) {
@@ -551,6 +686,11 @@ module.exports = (core) => {
           conversation.currentUsage.reportedInputTokens += inputTokens;
           conversation.currentUsage.reportedOutputTokens += outputTokens;
           conversation.currentUsage.reportedTokenTurns += 1;
+        }
+        const costUsd = Number(event.usage.cost_usd ?? event.usage.costUsd ?? event.usage.total_cost_usd);
+        if (Number.isFinite(costUsd) && costUsd >= 0) {
+          conversation.currentUsage.reportedCostUsd += costUsd;
+          conversation.currentUsage.costReported = true;
         }
       }
     }
@@ -566,19 +706,33 @@ module.exports = (core) => {
       pendingApprovals.delete(approvalId);
       approval.resolve({ kind: 'reject', feedback: 'Agent session closed.' });
     }
-    if (conversation.provider === 'copilot') {
-      await conversation.client.stop();
-    } else if (conversation.controller) {
-      conversation.controller.abort();
-    } else if (conversation.proc) {
-      conversation.cancelled = true;
-      stopProcess(conversation.proc);
+    let cleanupError = null;
+    try {
+      if (conversation.provider === 'copilot') {
+        await conversation.client.stop();
+      } else if (conversation.controller) {
+        conversation.controller.abort();
+      } else if (conversation.proc) {
+        conversation.cancelled = true;
+        stopProcess(conversation.proc);
+      }
+    } catch (error) {
+      cleanupError = error;
+    } finally {
+      if (conversation.runId) {
+        try { await runtime.setStatus(conversation.runId, 'cancelled'); }
+        catch (error) { core.log('error', `agent close status could not be persisted: ${error.message}`, 'AGENTS'); }
+      }
     }
+    if (cleanupError) throw cleanupError;
     return true;
   }
 
   core.onShutdown(async () => {
-    for (const id of conversations.keys()) await closeConversation(id);
+    for (const id of [...conversations.keys()]) {
+      try { await closeConversation(id); }
+      catch (error) { core.log('error', `agent shutdown cleanup failed: ${error.message}`, 'AGENTS'); }
+    }
   });
 
   return {
@@ -661,6 +815,7 @@ module.exports = (core) => {
         throw new Error('The computer has reached its current agent concurrency capacity. Wait for an agent to finish before starting another.');
       }
       creatingConversations++;
+      let run = null;
       try {
         const cwd = workingDirectory(cwdValue);
         const options = agentOptions(provider, optionsValue);
@@ -672,16 +827,53 @@ module.exports = (core) => {
         options.accountId = requestedAccountId;
         const accountEnv = accountEnvironment(provider, requestedAccountId);
         const id = randomUUID();
+        run = await runtime.createRun({
+          provider,
+          cwd,
+          accountId: requestedAccountId,
+          role: 'worker',
+          config: {
+            model: options.model,
+            reasoningEffort: options.reasoningEffort,
+            webSearchMode: options.webSearchMode,
+            agentMode: options.agentMode,
+            permissionMode: options.permissionMode,
+            enableMcp: options.enableMcp,
+            budgetUsdPerRun: provider === 'copilot' ? 2 : provider === 'codex' ? 3 : 5
+          }
+        });
+        options.runId = run.id;
+        if (Array.isArray(optionsValue?.previousContext)) {
+          for (const entry of optionsValue.previousContext.slice(-100)) {
+            if (!entry || typeof entry.text !== 'string') continue;
+            await runtime.appendTurn(run.id, {
+              turn: 0,
+              role: entry.role === 'assistant' ? 'assistant' : 'user',
+              provider: typeof entry.provider === 'string' ? entry.provider : provider,
+              content: entry.text,
+              usage: { tokensIn: 0, tokensOut: 0, costUsd: 0 }
+            });
+          }
+        }
         const conversation = provider === 'copilot'
           ? await createCopilotConversation(id, cwd, options, accountEnv)
           : provider === 'codex'
             ? await createCodexConversation(id, cwd, options, accountEnv)
-            : {
+            : provider === 'local'
+              ? { id, provider: 'local', cwd, options, busy: false, controller: null,
+                  accountId: options.accountId, accountEnv, currentUsage: null, runId: run.id, turn: 0 }
+              : {
               id, provider: 'claude', cwd, options, busy: false, proc: null, cancelled: false,
-              accountId: options.accountId, accountEnv, currentUsage: null
+              accountId: options.accountId, accountEnv, currentUsage: null, runId: options.runId, turn: 0
             };
         conversations.set(id, conversation);
-        return { id, cwd, provider };
+        return { id, cwd, provider, runId: run.id };
+      } catch (error) {
+        if (run) {
+          try { await runtime.setStatus(run.id, 'failed', error.message); }
+          catch (statusError) { core.log('error', `agent startup failure could not be persisted: ${statusError.message}`, 'AGENTS'); }
+        }
+        throw error;
       } finally {
         creatingConversations--;
       }
@@ -691,37 +883,127 @@ module.exports = (core) => {
       if (!conversation) throw new Error('Agent chat is no longer available.');
       if (conversation.busy) throw new Error('Wait for the current agent response to finish.');
       if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 20000) throw new Error('Enter a prompt under 20,000 characters.');
+      await runtime.checkBudget(conversation.runId);
+      for (const budget of budgetScopes(conversation)) {
+        const check = await platform.checkBudget({ ...budget, amountUsd: 0 });
+        if (!check.allowed) throw new Error(check.reason || `${budget.scope} budget is exhausted.`);
+      }
       conversation.busy = true;
+      conversation.turn = (conversation.turn || 0) + 1;
       conversation.currentUsage = {
         inputChars: prompt.trim().length,
         outputChars: 0,
+        outputText: '',
         reportedInputTokens: 0,
         reportedOutputTokens: 0,
         reportedTokenTurns: 0,
+        reportedCostUsd: 0,
+        costReported: false,
+        completed: false,
         outputItems: new Map()
       };
       emit(id, { type: 'started' });
+      let completedTurn = null;
+      let providerError = null;
       try {
+        await runtime.appendTurn(conversation.runId, {
+          turn: conversation.turn,
+          role: 'user',
+          provider: conversation.provider,
+          content: prompt.trim(),
+          usage: { tokensIn: 0, tokensOut: 0, costUsd: 0 }
+        });
+        const messages = await providerMessages(conversation);
+        const initialPrompt = conversation.turn === 1
+          ? providerPrompt(prompt.trim(), messages.slice(0, -1))
+          : prompt.trim();
         if (conversation.provider === 'copilot') {
-          await conversation.session.sendAndWait({ prompt: prompt.trim() }, COPILOT_SEND_TIMEOUT_MS);
+          await conversation.session.sendAndWait({ prompt: initialPrompt }, COPILOT_SEND_TIMEOUT_MS);
         } else if (conversation.provider === 'codex') {
-          await runCodex(conversation, prompt.trim());
+          await runCodex(conversation, initialPrompt);
+        } else if (conversation.provider === 'claude') {
+          conversation.currentUsage.outputText = await runClaude(conversation, prompt.trim(), messages.slice(0, -1));
         } else {
-          await runClaude(conversation, prompt.trim());
+          const controller = new AbortController();
+          conversation.controller = controller;
+          const local = await platform.runLocalModel({
+            prompt: prompt.trim(),
+            messages,
+            model: conversation.options.model,
+            signal: controller.signal
+          });
+          conversation.currentUsage.outputText = local.output;
+          conversation.currentUsage.outputChars = local.output.length;
+          const inputTokens = Number(local.usage?.prompt_tokens ?? local.usage?.input_tokens);
+          const outputTokens = Number(local.usage?.completion_tokens ?? local.usage?.output_tokens);
+          if (Number.isFinite(inputTokens) && Number.isFinite(outputTokens)) {
+            conversation.currentUsage.reportedInputTokens += inputTokens;
+            conversation.currentUsage.reportedOutputTokens += outputTokens;
+            conversation.currentUsage.reportedTokenTurns += 1;
+          }
+          if (Number.isFinite(local.costUsd) && local.costUsd >= 0) {
+            conversation.currentUsage.reportedCostUsd += local.costUsd;
+            conversation.currentUsage.costReported = true;
+          }
+          emit(id, { type: 'replace', text: local.output });
         }
+        conversation.currentUsage.completed = true;
+      } catch (error) {
+        providerError = error;
+        try { await runtime.setStatus(conversation.runId, 'failed', error.message); }
+        catch (statusError) { core.log('error', `agent failure status could not be persisted: ${statusError.message}`, 'AGENTS'); }
       } finally {
-        const turn = conversation.currentUsage;
+        completedTurn = conversation.currentUsage;
         conversation.currentUsage = null;
-        if (turn) {
-          try { await recordUsage(conversation, turn); }
+        if (completedTurn) {
+          try { await recordUsage(conversation, completedTurn); }
           catch (error) {
             core.log('error', `agent usage tracking failed: ${error.message}`, 'AGENTS');
             emit(id, { type: 'usage-error', message: 'Usage totals could not be saved.' });
           }
         }
-        conversation.busy = false;
         conversation.controller = null;
       }
+      if (providerError) {
+        conversation.busy = false;
+        throw providerError;
+      }
+      try {
+        const accountingErrors = [];
+        try {
+          await platform.recordSpend({
+            scopes: budgetScopes(conversation),
+            amountUsd: completedTurn.costReported ? completedTurn.reportedCostUsd : null
+          });
+        } catch (error) { accountingErrors.push(error.message); }
+        try {
+          await runtime.appendTurn(conversation.runId, {
+            turn: conversation.turn,
+            role: 'assistant',
+            provider: conversation.provider,
+            content: completedTurn.outputText || 'Done.',
+            usage: {
+              tokensIn: Number(completedTurn.reportedInputTokens) || 0,
+              tokensOut: Number(completedTurn.reportedOutputTokens) || 0,
+              costUsd: completedTurn.costReported ? completedTurn.reportedCostUsd : 0,
+              costKnown: completedTurn.costReported,
+              turnComplete: true
+            },
+            toolCalls: []
+          });
+        } catch (error) {
+          accountingErrors.push(error.message);
+        }
+        try { await runtime.setStatus(conversation.runId, 'active'); }
+        catch (error) { accountingErrors.push(error.message); }
+        if (accountingErrors.length) throw new Error(accountingErrors.join('; '));
+      } catch (error) {
+        core.log('error', `completed agent response could not be fully persisted: ${error.message}`, 'AGENTS');
+        emit(id, { type: 'persistence-error', message: 'The response completed, but its run history or budget record could not be saved.' });
+        conversation.busy = false;
+        throw new Error(`Provider completed, but run accounting could not be saved: ${error.message}`);
+      }
+      conversation.busy = false;
       emit(id, { type: 'done' });
       return true;
     },
@@ -741,6 +1023,24 @@ module.exports = (core) => {
       if (!approval) return false;
       pendingApprovals.delete(approvalId);
       clearTimeout(approval.timer);
+      const conversation = conversations.get(approval.conversationId);
+      try {
+        if (conversation?.runId) {
+          await runtime.recordApproval(conversation.runId, {
+            id: approvalId,
+            turn: conversation.turn || 1,
+            provider: conversation.provider,
+            tool: 'unknown',
+            arguments: {},
+            riskSummary: 'Permission action resolved by the user.',
+            outcome: approved === true ? 'approved' : 'rejected',
+            actor: 'user'
+          });
+        }
+      } catch (error) {
+        approval.resolve({ kind: 'reject', feedback: 'Approval could not be recorded; the action was denied.' });
+        throw error;
+      }
       approval.resolve(approved === true
         ? { kind: 'approved' }
         : { kind: 'reject', feedback: 'The user denied this permission in PHANTOM.' });

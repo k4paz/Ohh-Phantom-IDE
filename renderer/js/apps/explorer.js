@@ -108,10 +108,6 @@ export default {
         { header: basename(p) },
         !isDir ? { label: 'Open', action: () => bus.emit('open-file', p, {}) } : null,
         !isDir ? { label: 'Open in new editor', action: () => bus.emit('open-file', p, { newWindow: true }) } : null,
-        !row && root ? { label: 'Open Agent Flow Here', action: async () => {
-          await wm.open('flow');
-          bus.emit('flow:add-folder', p);
-        } } : null,
         !isDir && /^(md|markdown)$/.test(e2) ? { label: 'Markdown preview', action: () => wm.open('markdown', { state: { path: p } }) } : null,
         !isDir && /^json/.test(e2) ? { label: 'JSON viewer', action: () => wm.open('json', { state: { path: p } }) } : null,
         !isDir && /\.(db|sqlite3?|db3)$/i.test(p) ? { label: 'Open in database explorer', action: () => wm.open('db', { state: { conn: { type: 'sqlite', file: p } } }) } : null,

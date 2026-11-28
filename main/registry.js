@@ -7,7 +7,7 @@ const path = require('path');
 
 const SERVICES = [
   'app', 'store', 'fs', 'watch', 'pty', 'sys', 'proc', 'net', 'git', 'search',
-  'http', 'db', 'ssh', 'audit', 'tasks', 'debug', 'arch', 'logs', 'collab', 'events', 'agents', 'flow',
+  'http', 'db', 'ssh', 'audit', 'tasks', 'debug', 'arch', 'logs', 'collab', 'events', 'agent-runtime', 'agent-platform', 'agents', 'flow',
   'flow-workspaces'
 ];
 
