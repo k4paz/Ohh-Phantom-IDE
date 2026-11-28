@@ -1,12 +1,16 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { promisify } from 'node:util';
 import declaration from './extension.json' with { type: 'json' };
 import { CanvasError, createCanvas, joinSession } from '@github/copilot-sdk/extension';
-import { readState, writeState } from './storage.mjs';
+import { readState, updateState } from './storage.mjs';
 import { createDashboardServer, serverUrl } from './server.mjs';
 
 const canvasId = 'phantom-project-dashboard';
 const instances = new Map();
+const execFileAsync = promisify(execFile);
 
 function objectInput(input) {
   return input && typeof input === 'object' && !Array.isArray(input) ? input : {};
@@ -19,7 +23,7 @@ function workspaceRoot(input) {
 
 async function snapshot(root) {
   let branch = '';
-  let changedFiles = 0;
+  let changedFiles = 'unknown';
   let packageScripts = 0;
 
   try {
@@ -30,11 +34,13 @@ async function snapshot(root) {
   } catch {}
 
   try {
-    const entries = await fs.readdir(root, { withFileTypes: true });
-    changedFiles = entries.filter(entry => entry.name === '.phantom'
-      || entry.name === 'node_modules'
-      || entry.name === 'package-lock.json'
-      || entry.name === 'package.json').length;
+    const { stdout } = await execFileAsync('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
+      cwd: root,
+      timeout: 5000,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024
+    });
+    changedFiles = stdout.split(/\r?\n/).filter(Boolean).length;
   } catch {}
 
   try {
@@ -57,31 +63,34 @@ async function open({ instanceId, input }) {
     if (existing) {
       existing.root = workspaceRoot(input);
       existing.state = await readState(canvasId, existing.root);
-      return await serverUrl(existing.server);
+      return await serverUrl(existing.server, existing.accessToken);
     }
 
     const root = workspaceRoot(input);
     const state = await readState(canvasId, root);
+    const accessToken = randomBytes(32).toString('base64url');
     const record = {
       root,
       state,
-      server: null
+      server: null,
+      accessToken
     };
     record.server = createDashboardServer({
       getSnapshot: () => snapshot(record.root),
       getState: () => readState(canvasId, record.root),
+      accessToken,
       onAddNote: async text => {
-        record.state = await readState(canvasId, record.root);
-        record.state.notes.push({
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          text,
-          createdAt: new Date().toISOString()
+        record.state = await updateState(canvasId, record.root, state => {
+          state.notes.push({
+            id: randomUUID(),
+            text,
+            createdAt: new Date().toISOString()
+          });
         });
-        await writeState(canvasId, record.state);
       }
     });
     instances.set(instanceId, record);
-    return await serverUrl(record.server);
+    return await serverUrl(record.server, record.accessToken);
   } catch (error) {
     throw error instanceof CanvasError
       ? error
@@ -107,13 +116,13 @@ const actionHandlers = {
       if (!text || text.length > 500) {
         throw new CanvasError('INVALID_NOTE', 'Note text must be 1 to 500 characters');
       }
-      instance.state = await readState(canvasId, instance.root);
-      instance.state.notes.push({
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        text,
-        createdAt: new Date().toISOString()
+      instance.state = await updateState(canvasId, instance.root, state => {
+        state.notes.push({
+          id: randomUUID(),
+          text,
+          createdAt: new Date().toISOString()
+        });
       });
-      await writeState(canvasId, instance.state);
       return { ok: true, noteCount: instance.state.notes.length };
     } catch (error) {
       throw error instanceof CanvasError

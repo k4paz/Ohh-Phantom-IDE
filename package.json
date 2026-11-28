@@ -17,7 +17,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "test": "node tools/backend-test.js && node tools/agent-runtime-test.js && node tools/agent-platform-test.js && npm run test:collab",
+    "test": "node tools/backend-test.js && node tools/agent-runtime-test.js && node tools/agent-platform-test.js && node tools/dashboard-test.mjs && npm run test:collab",
     "test:backend": "node tools/backend-test.js",
     "test:runtime": "node tools/agent-runtime-test.js",
     "test:agent-platform": "node tools/agent-platform-test.js",
@@ -52,6 +52,7 @@
     "files": [
       "main/**",
       "renderer/**",
+      "skills/**",
       "package.json"
     ],
     "asarUnpack": [

@@ -14,9 +14,8 @@ module.exports = (core) => {
   return {
     'agent:platform:sqlite:open': async () => {
       await platform.openDatabase();
-      let engine = 'sql.js';
-      try { require('node:sqlite'); engine = 'node:sqlite'; } catch {}
-      return { opened: true, engine };
+      const engine = platform.databaseEngine();
+      return { opened: true, engine: engine === 'native' ? 'node:sqlite' : engine === 'sqljs' ? 'sql.js' : engine };
     },
     'agent:platform:run:save': async (run) => platform.saveRun(run),
     'agent:platform:run:get': async (runId) => platform.getRun(runId),
@@ -34,6 +33,7 @@ module.exports = (core) => {
     'agent:platform:cache:set': async (key, value, ttlMs) => platform.cacheSet(key, value, ttlMs),
     'agent:platform:budget:set': async (budget) => platform.setBudget(budget),
     'agent:platform:budget:check': async (budget) => platform.checkBudget(budget),
+    'agent:platform:budget:spend': async (spend) => platform.recordSpend(spend),
     'agent:platform:mcp:list': async () => platform.mcpList(),
     'agent:platform:mcp:discover': async (config) => platform.mcpDiscover(config),
     'agent:platform:mcp:register': async (tool) => platform.mcpRegisterTool(tool),

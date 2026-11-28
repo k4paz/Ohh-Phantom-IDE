@@ -1,5 +1,6 @@
 import http from 'node:http';
 import path from 'node:path';
+import { timingSafeEqual } from 'node:crypto';
 
 export function escapeHtml(value) {
   return String(value)
@@ -10,48 +11,123 @@ export function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
-export function createDashboardServer({ getSnapshot, getState, onAddNote }) {
+export function createDashboardServer({ getSnapshot, getState, onAddNote, accessToken }) {
+  function authorized(request, expectedHost, expectedOrigin, requireOrigin = false) {
+    if (typeof accessToken !== 'string' || !accessToken) return false;
+    const supplied = request.headers['x-phantom-token'];
+    const expected = Buffer.from(accessToken || '');
+    const actual = Buffer.from(typeof supplied === 'string' ? supplied : '');
+    if (request.headers.host !== expectedHost ||
+      (requireOrigin && request.headers.origin !== expectedOrigin) ||
+      (request.headers.origin && request.headers.origin !== expectedOrigin) ||
+      actual.length !== expected.length || !timingSafeEqual(actual, expected)) return false;
+    return true;
+  }
+
+  function sendJson(response, status, value) {
+    response.statusCode = status;
+    response.setHeader('Content-Type', 'application/json; charset=utf-8');
+    response.end(JSON.stringify(value));
+  }
+
+  function readLimitedBody(request, response, limit) {
+    return new Promise((resolve, reject) => {
+      let size = 0;
+      let chunks = [];
+      let rejected = false;
+      request.on('data', chunk => {
+        if (rejected) return;
+        size += chunk.length;
+        if (size > limit) {
+          rejected = true;
+          chunks = [];
+          sendJson(response, 413, { error: 'Request body is too large.' });
+          request.resume();
+          resolve(null);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      request.once('end', () => {
+        if (!rejected) resolve(Buffer.concat(chunks).toString('utf8'));
+      });
+      request.once('error', error => {
+        if (!rejected) reject(error);
+      });
+    });
+  }
+
   const server = http.createServer(async (request, response) => {
-    const url = new URL(request.url || '/', 'http://127.0.0.1');
+    const address = server.address();
+    const expectedHost = `127.0.0.1:${address.port}`;
+    const expectedOrigin = `http://${expectedHost}`;
+    const url = new URL(request.url || '/', expectedOrigin);
     response.setHeader('X-Content-Type-Options', 'nosniff');
+    response.setHeader('Referrer-Policy', 'no-referrer');
+
+    if (request.headers.host !== expectedHost) {
+      sendJson(response, 403, { error: 'Invalid dashboard host.' });
+      return;
+    }
 
     if (request.method === 'GET' && url.pathname === '/') {
+      const suppliedToken = url.searchParams.get('token') || '';
+      if (typeof accessToken !== 'string' || !accessToken) {
+        sendJson(response, 403, { error: 'Dashboard token is unavailable.' });
+        return;
+      }
+      const expectedToken = Buffer.from(accessToken || '');
+      const actualToken = Buffer.from(suppliedToken);
+      if (actualToken.length !== expectedToken.length || !timingSafeEqual(actualToken, expectedToken)) {
+        sendJson(response, 403, { error: 'Invalid dashboard token.' });
+        return;
+      }
       response.setHeader('Content-Type', 'text/html; charset=utf-8');
-      response.end(renderPage());
+      response.end(renderPage(accessToken));
       return;
     }
 
     if (request.method === 'GET' && url.pathname === '/api/state') {
+      if (!authorized(request, expectedHost, expectedOrigin)) {
+        sendJson(response, 403, { error: 'Dashboard authorization failed.' });
+        return;
+      }
       try {
         const snapshot = await getSnapshot();
         const state = await getState();
-        response.setHeader('Content-Type', 'application/json; charset=utf-8');
-        response.end(JSON.stringify({ snapshot, notes: state.notes }));
+        sendJson(response, 200, { snapshot, notes: state.notes });
       } catch (error) {
-        response.statusCode = 500;
-        response.setHeader('Content-Type', 'application/json');
-        response.end(JSON.stringify({ error: error.message }));
+        sendJson(response, 500, { error: error.message });
       }
       return;
     }
 
     if (request.method === 'POST' && url.pathname === '/api/notes') {
+      if (!authorized(request, expectedHost, expectedOrigin, true)) {
+        sendJson(response, 403, { error: 'Dashboard authorization failed.' });
+        return;
+      }
+      if (!/^application\/json(?:\s*;|$)/i.test(request.headers['content-type'] || '')) {
+        sendJson(response, 415, { error: 'Content-Type must be application/json.' });
+        request.resume();
+        return;
+      }
+      if (Number(request.headers['content-length']) > 2048) {
+        sendJson(response, 413, { error: 'Request body is too large.' });
+        request.resume();
+        return;
+      }
       try {
-        const chunks = [];
-        for await (const chunk of request) chunks.push(chunk);
-        if (Buffer.concat(chunks).length > 2048) throw new Error('Request body is too large');
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+        const rawBody = await readLimitedBody(request, response, 2048);
+        if (rawBody === null) return;
+        const body = JSON.parse(rawBody || '{}');
         if (typeof body.text !== 'string' || body.text.trim().length === 0 || body.text.length > 500) {
           throw new Error('Note text must be a non-empty string of at most 500 characters');
         }
         await onAddNote(body.text.trim());
-        response.statusCode = 201;
-        response.setHeader('Content-Type', 'application/json');
-        response.end(JSON.stringify({ ok: true }));
+        sendJson(response, 201, { ok: true });
       } catch (error) {
-        response.statusCode = 400;
-        response.setHeader('Content-Type', 'application/json');
-        response.end(JSON.stringify({ error: error.message }));
+        sendJson(response, 400, { error: error.message });
       }
       return;
     }
@@ -65,7 +141,7 @@ export function createDashboardServer({ getSnapshot, getState, onAddNote }) {
   return server;
 }
 
-export async function serverUrl(server) {
+export async function serverUrl(server, accessToken) {
   if (!server.listening) {
     await new Promise((resolve, reject) => {
       server.once('listening', resolve);
@@ -73,10 +149,10 @@ export async function serverUrl(server) {
     });
   }
   const address = server.address();
-  return `http://127.0.0.1:${address.port}/`;
+  return `http://127.0.0.1:${address.port}/?token=${encodeURIComponent(accessToken)}`;
 }
 
-function renderPage() {
+function renderPage(accessToken) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -124,9 +200,10 @@ function renderPage() {
     </section>
   </main>
   <script>
+    const accessToken = ${JSON.stringify(accessToken)};
     const escapeText = (value) => String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     async function load() {
-      const response = await fetch('/api/state');
+      const response = await fetch('/api/state', { headers: { 'X-Phantom-Token': accessToken } });
       if (!response.ok) throw new Error('Could not load dashboard state');
       const data = await response.json();
       document.querySelector('#workspace').textContent = data.snapshot.workspaceRoot || 'No workspace selected';
@@ -144,7 +221,7 @@ function renderPage() {
         try {
           const response = await fetch('/api/notes', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'X-Phantom-Token': accessToken },
             body: JSON.stringify({ text: input.value })
           });
           const data = await response.json();

@@ -63,6 +63,7 @@ function hashChain(previous, record) {
 }
 
 function createRuntime(core) {
+  if (core.agentRuntime) return core.agentRuntime;
   const platform = createPlatform(core);
   core.onShutdown(() => platform.close());
   const root = path.join(core.dataDir, 'agent-runtime');
@@ -70,6 +71,7 @@ function createRuntime(core) {
   const auditDir = path.join(root, 'audit');
   const scorecardFile = path.join(root, 'scorecards.json');
   const writes = new Map();
+  const auditWrites = new Map();
 
   async function ensureDir(directory) {
     await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -99,19 +101,28 @@ function createRuntime(core) {
   }
 
   async function audit(runId, record) {
-    await ensureDir(auditDir);
-    const file = path.join(auditDir, `${runId}.jsonl`);
-    let previous = '';
+    const previousWrite = auditWrites.get(runId) || Promise.resolve();
+    const next = previousWrite.catch(() => {}).then(async () => {
+      await ensureDir(auditDir);
+      const file = path.join(auditDir, `${runId}.jsonl`);
+      let previous = '';
+      try {
+        const lines = (await fsp.readFile(file, 'utf8')).trim().split(/\r?\n/).filter(Boolean);
+        if (lines.length) previous = JSON.parse(lines[lines.length - 1]).hash;
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      const entry = { ...record, ts: Date.now(), previousHash: previous || null, hash: '' };
+      entry.hash = hashChain(previous, entry);
+      await fsp.appendFile(file, `${JSON.stringify(entry)}\n`, { encoding: 'utf8', mode: 0o600 });
+      return entry;
+    });
+    auditWrites.set(runId, next);
     try {
-      const lines = (await fsp.readFile(file, 'utf8')).trim().split(/\r?\n/).filter(Boolean);
-      if (lines.length) previous = JSON.parse(lines[lines.length - 1]).hash;
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
+      return await next;
+    } finally {
+      if (auditWrites.get(runId) === next) auditWrites.delete(runId);
     }
-    const entry = { ...record, ts: Date.now(), previousHash: previous || null, hash: '' };
-    entry.hash = hashChain(previous, entry);
-    await fsp.appendFile(file, `${JSON.stringify(entry)}\n`, { encoding: 'utf8', mode: 0o600 });
-    return entry;
   }
 
   async function mutateRun(runId, mutate) {
@@ -165,11 +176,14 @@ function createRuntime(core) {
   }
 
   async function appendTurn(runId, entry) {
+    const rawContent = String(entry.content || '');
+    const content = rawContent.replace(/\0/g, '').slice(0, 20000);
     const turn = {
       turn: Number(entry.turn) || 1,
       role: String(entry.role || 'worker'),
       provider: String(entry.provider || ''),
-      content: safeText(String(entry.content || ''), 20000),
+      content,
+      truncated: content.length < rawContent.length,
       toolCalls: Array.isArray(entry.toolCalls) ? entry.toolCalls : [],
       artifacts: Array.isArray(entry.artifacts) ? entry.artifacts : [],
       approval: entry.approval || null,
@@ -182,6 +196,13 @@ function createRuntime(core) {
       state.usage.tokensIn += Number(turn.usage.tokensIn) || 0;
       state.usage.tokensOut += Number(turn.usage.tokensOut) || 0;
       state.usage.costUsd += Number(turn.usage.costUsd) || 0;
+      if (turn.usage.turnComplete === true) {
+        if (turn.usage.costKnown === true) {
+          state.usage.knownCostUsd = (Number(state.usage.knownCostUsd) || 0) + (Number(turn.usage.costUsd) || 0);
+        } else {
+          state.usage.unpricedTurns = (Number(state.usage.unpricedTurns) || 0) + 1;
+        }
+      }
       state.trace.spans.push({
         id: randomUUID(),
         name: 'invoke_agent',
@@ -400,13 +421,16 @@ function createRuntime(core) {
     const providerDefaults = { copilot: 2, codex: 3, claude: 5 };
     const budget = Number(run.config?.budgetUsdPerRun) ||
       providerDefaults[run.provider] || 2;
+    if ((Number(run.usage.unpricedTurns) || 0) > 0) {
+      throw new Error('The previous turn had no provider-reported cost; this run budget is paused until cost data is available.');
+    }
     if (run.usage.costUsd >= budget) {
       throw new Error(`Provider budget of $${budget.toFixed(2)} exhausted for this run.`);
     }
     return { budgetUsd: budget, spentUsd: run.usage.costUsd, remainingUsd: Math.max(0, budget - run.usage.costUsd) };
   }
 
-  return {
+  const api = {
     createRun,
     appendTurn,
     getRun,
@@ -425,6 +449,8 @@ function createRuntime(core) {
     checkBudget,
     tools: () => Object.values(TOOL_CATALOG)
   };
+  core.agentRuntime = api;
+  return api;
 }
 
 module.exports = { createRuntime, safeText, ROLE_PERMISSIONS, TOOL_CATALOG };
